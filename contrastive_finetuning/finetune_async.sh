@@ -10,7 +10,7 @@
 
 batch_size=2
 
-accelerate launch --num_processes ${SLURM_GPUS_ON_NODE:-1} -m finetuning.train \
+accelerate launch --num_processes ${SLURM_GPUS_ON_NODE:-1} -m contrastive_finetuning.train \
     --train_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/train/ \
     --val_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/test/ \
     --rdd_weights rdd/weights/RDD-v2.pth \

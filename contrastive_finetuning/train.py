@@ -11,9 +11,9 @@ from accelerate import Accelerator
 from torchvision import transforms
 
 from rdd.RDD.utils import to_pixel_coords
-from finetuning.loading import TripletImageFolder, FixedTripletDataset, get_loader
-from finetuning.models import build_rdd, build_masked_lg
-from finetuning.process import align_tensors_to_max_length
+from contrastive_finetuning.loading import TripletImageFolder, FixedTripletDataset, get_loader
+from contrastive_finetuning.models import build_rdd, build_masked_lg
+from contrastive_finetuning.process import align_tensors_to_max_length
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
