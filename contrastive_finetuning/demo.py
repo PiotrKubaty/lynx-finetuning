@@ -35,10 +35,6 @@ def draw_matches(ref_points, dst_points, conf, img0, img1,
     dst_points = np.asarray(dst_points)
     conf = np.asarray(conf)
 
-    cmap = plt.cm.viridis
-    # colors = cmap(conf)[:, :3]
-    # colors = (colors[:, ::-1] * 255).astype(np.uint8)
-
     h0, w0 = img0.shape[:2]
     h1, w1 = img1.shape[:2]
     H = max(h0, h1)
@@ -74,7 +70,6 @@ def select_top_matches_per_patch(
     mkpts_1 = np.asarray(mkpts_1)
     conf = np.asarray(conf)
 
-    # sortujemy malejąco po confidence
     order = np.argsort(-conf)
 
     h0, w0 = img0.shape[:2]
@@ -90,7 +85,6 @@ def select_top_matches_per_patch(
         px = int(x0 // patch_size)
         py = int(y0 // patch_size)
 
-        # zabezpieczenie brzegowe
         if px < 0 or py < 0 or px >= n_patches_x or py >= n_patches_y:
             continue
 

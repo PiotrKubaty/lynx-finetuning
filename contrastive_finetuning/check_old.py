@@ -34,8 +34,8 @@ OUT_POS.mkdir(exist_ok=True)
 OUT_NEG.mkdir(exist_ok=True)
 
 # ── dataset & loader ─────────────────────────────────────────────────────────
-from finetuning.loading import TripletImageFolder, get_loader
-from finetuning.models import build_rdd
+from contrastive_finetuning.loading import TripletImageFolder, get_loader
+from contrastive_finetuning.models import build_rdd
 from rdd.RDD.RDD_helper import RDD_helper
 
 # ToTensor needed so DataLoader can collate into a single batch tensor.

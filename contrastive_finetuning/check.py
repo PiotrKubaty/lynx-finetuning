@@ -35,9 +35,9 @@ OUT_POS.mkdir(exist_ok=True)
 OUT_NEG.mkdir(exist_ok=True)
 
 # ── dataset & loader ──────────────────────────────────────────────────────────
-from finetuning.loading import TripletImageFolder, get_loader
-from finetuning.models import build_rdd, build_masked_lg
-from finetuning.process import FrameFeat, get_batched_data, get_matches_lightglue
+from contrastive_finetuning.loading import TripletImageFolder, get_loader
+from contrastive_finetuning.models import build_rdd, build_masked_lg
+from contrastive_finetuning.process import FrameFeat, get_batched_data, get_matches_lightglue
 
 transform = transforms.ToTensor()
 
