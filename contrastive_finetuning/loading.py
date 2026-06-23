@@ -11,12 +11,15 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
+from contrastive_finetuning.pair_quality import PairMiningConfig, PairQualityCache
+
 
 class RandomLike(Protocol):
     def choice(self, seq): ...
     def sample(self, population, k: int): ...
     def shuffle(self, x): ...
     def choices(self, population, k: int): ...
+    def random(self) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,9 @@ class SampleMeta:
 
 
 class _SequenceAwareImageFolderBase:
+    pair_quality_cache: PairQualityCache | None = None
+    pair_mining_config: PairMiningConfig | None = None
+
     def _init_sequence_metadata(self, root: str | Path, sequence_aware_sampling: bool) -> None:
         self._root = Path(root)
         self.sequence_aware_sampling = sequence_aware_sampling
@@ -63,6 +69,17 @@ class _SequenceAwareImageFolderBase:
             self._class_to_source_sequence_to_indices[label][(source_id, sequence_id)].append(idx)
 
     def _sample_positive_index(self, index: int, rng: RandomLike | random.Random = random) -> int:
+        if (
+            self.pair_quality_cache is not None
+            and self.pair_mining_config is not None
+            and self.pair_mining_config.use_pair_quality_mining
+        ):
+            mined = self.pair_quality_cache.sample_positive_index(
+                index, self, rng, self.pair_mining_config
+            )
+            if mined is not None:
+                return mined
+
         label = self.targets[index]
         if not self.sequence_aware_sampling:
             pos_pool = self._class_to_indices[label]
@@ -102,13 +119,39 @@ class _SequenceAwareImageFolderBase:
             return rng.choice(same_sequence)
         return index
 
-    def _sample_negative_index(self, label: int, rng: RandomLike | random.Random = random) -> int:
+    def _sample_negative_index(self, label: int, rng: RandomLike | random.Random = random, anchor_idx: int | None = None) -> int:
+        if (
+            anchor_idx is not None
+            and self.pair_quality_cache is not None
+            and self.pair_mining_config is not None
+            and self.pair_mining_config.use_pair_quality_mining
+        ):
+            mined = self.pair_quality_cache.sample_negative_index(
+                anchor_idx, label, self, rng, self.pair_mining_config
+            )
+            if mined is not None:
+                return mined
+
         neg_label = label
         while neg_label == label:
             neg_label = rng.choice(list(self._class_to_indices.keys()))
         return rng.choice(self._class_to_indices[neg_label])
 
     def _sequence_diverse_indices(self, label: int, n_samples: int, rng: RandomLike | random.Random = random) -> list[int]:
+        if (
+            self.pair_quality_cache is not None
+            and self.pair_mining_config is not None
+            and self.pair_mining_config.use_pair_quality_mining
+            and n_samples >= 2
+        ):
+            seed_pool = self._class_to_indices[label]
+            seed_idx = rng.choice(seed_pool)
+            mined_group = self.pair_quality_cache.sample_balanced_group_indices(
+                seed_idx, label, n_samples, self, rng, self.pair_mining_config
+            )
+            if mined_group is not None and len(mined_group) == n_samples:
+                return mined_group
+
         if not self.sequence_aware_sampling:
             pool = self._class_to_indices[label]
             return rng.choices(pool, k=n_samples) if len(pool) < n_samples else rng.sample(pool, n_samples)
@@ -125,7 +168,6 @@ class _SequenceAwareImageFolderBase:
             rng.shuffle(indices)
 
         selected: list[int] = []
-        used_sources: set[str] = set()
         used_sequences: set[tuple[str, str]] = set()
 
         source_keys = list(source_groups.keys())
@@ -138,7 +180,6 @@ class _SequenceAwareImageFolderBase:
                 choice = indices.pop()
                 selected.append(choice)
                 meta = self._sample_meta[choice]
-                used_sources.add(meta.source_id)
                 used_sequences.add((meta.source_id, meta.sequence_id))
 
         sequence_keys = list(sequence_groups.keys())
@@ -154,7 +195,6 @@ class _SequenceAwareImageFolderBase:
                 choice = remaining.pop()
                 selected.append(choice)
                 meta = self._sample_meta[choice]
-                used_sources.add(meta.source_id)
                 used_sequences.add((meta.source_id, meta.sequence_id))
 
         unique_remaining = [idx for idx in self._class_to_indices[label] if idx not in selected]
@@ -168,6 +208,15 @@ class _SequenceAwareImageFolderBase:
         return selected
 
 
+def attach_pair_quality_cache(
+    dataset: _SequenceAwareImageFolderBase,
+    cache: PairQualityCache | None,
+    config: PairMiningConfig | None,
+) -> None:
+    dataset.pair_quality_cache = cache
+    dataset.pair_mining_config = config
+
+
 class TripletImageFolder(_SequenceAwareImageFolderBase, Dataset):
     """ImageFolder wrapper that returns (anchor, positive, negative) triplets."""
 
@@ -177,6 +226,8 @@ class TripletImageFolder(_SequenceAwareImageFolderBase, Dataset):
         transform: transforms.Compose | None = None,
         anchor_transform: transforms.Compose | None = None,
         sequence_aware_sampling: bool = False,
+        pair_quality_cache: PairQualityCache | None = None,
+        pair_mining_config: PairMiningConfig | None = None,
     ) -> None:
         self._base = ImageFolder(root=str(root), transform=None)
         self.transform = transform
@@ -186,6 +237,7 @@ class TripletImageFolder(_SequenceAwareImageFolderBase, Dataset):
         self.classes = self._base.classes
         self.class_to_idx = self._base.class_to_idx
         self._init_sequence_metadata(root, sequence_aware_sampling=sequence_aware_sampling)
+        attach_pair_quality_cache(self, pair_quality_cache, pair_mining_config)
 
     def __len__(self) -> int:
         return len(self._base)
@@ -197,7 +249,7 @@ class TripletImageFolder(_SequenceAwareImageFolderBase, Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         anchor_label = self._base.targets[index]
         pos_idx = self._sample_positive_index(index)
-        neg_idx = self._sample_negative_index(anchor_label)
+        neg_idx = self._sample_negative_index(anchor_label, anchor_idx=index)
 
         anchor_img = self._load(index)
         pos_img = self._load(pos_idx)
@@ -222,7 +274,7 @@ class FixedTripletDataset(Dataset):
         for anchor_idx in anchor_indices:
             anchor_label = base._base.targets[anchor_idx]
             pos_idx = base._sample_positive_index(anchor_idx, rng=rng)
-            neg_idx = base._sample_negative_index(anchor_label, rng=rng)
+            neg_idx = base._sample_negative_index(anchor_label, rng=rng, anchor_idx=anchor_idx)
             self._triplets.append((anchor_idx, pos_idx, neg_idx))
 
     def __len__(self) -> int:
@@ -250,9 +302,12 @@ class LabeledImageFolder(_SequenceAwareImageFolderBase, ImageFolder):
         root: str | Path,
         transform: transforms.Compose | None = None,
         sequence_aware_sampling: bool = False,
+        pair_quality_cache: PairQualityCache | None = None,
+        pair_mining_config: PairMiningConfig | None = None,
     ) -> None:
         super().__init__(root=str(root), transform=transform)
         self._init_sequence_metadata(root, sequence_aware_sampling=sequence_aware_sampling)
+        attach_pair_quality_cache(self, pair_quality_cache, pair_mining_config)
 
 
 class BalancedBatchSampler(Sampler[list[int]]):

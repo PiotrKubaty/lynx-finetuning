@@ -30,7 +30,9 @@ from contrastive_finetuning.loading import (
     get_loader,
 )
 from contrastive_finetuning.models import build_masked_lg, build_rdd
+from contrastive_finetuning.pair_quality import PairMiningConfig, PairQualityCache, validate_cache_metadata
 from contrastive_finetuning.process import align_tensors_to_max_length
+from contrastive_finetuning.retrieval_probe import run_retrieval_probe
 
 
 @dataclass
@@ -80,6 +82,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_eval_visuals", type=int, default=4)
     p.add_argument("--eval_metrics_profile", choices=["basic", "extended"], default="basic")
     p.add_argument("--sequence_aware_sampling", type=lambda x: str(x).lower() in {"1", "true", "yes", "y", "on"}, default=True)
+
+    p.add_argument("--use_pair_quality_mining", action="store_true")
+    p.add_argument("--pair_quality_cache_dir", type=Path, default=None)
+    p.add_argument("--positive_quality_mode", choices=["random", "ranked", "bucketed"], default="bucketed")
+    p.add_argument("--positive_high_ratio", type=float, default=0.7)
+    p.add_argument("--positive_medium_ratio", type=float, default=0.3)
+    p.add_argument("--exclude_low_quality_positives", action="store_true", help="Exclude low-quality positives (default when mining enabled).")
+    p.add_argument("--include_low_quality_positives", action="store_true", help="Allow low-quality positives during mining.")
+    p.add_argument("--use_hard_negative_cache", action="store_true", help="Mix in cached hard negatives (default when mining enabled).")
+    p.add_argument("--no_hard_negative_cache", action="store_true", help="Disable cached hard negatives.")
+    p.add_argument("--hard_negative_ratio", type=float, default=0.5)
+    p.add_argument("--max_positive_candidates_per_anchor", type=int, default=32)
+    p.add_argument("--max_negative_candidates_per_anchor", type=int, default=32)
+
+    p.add_argument("--use_retrieval_probe", action="store_true")
+    p.add_argument("--retrieval_probe_num_queries", type=int, default=8)
+    p.add_argument("--retrieval_probe_gallery_per_id", type=int, default=2)
+    p.add_argument("--retrieval_probe_frames_per_seq", type=int, default=2)
+    p.add_argument("--retrieval_probe_every_n_epochs", type=int, default=1)
+    p.add_argument("--retrieval_probe_top_m_pool", type=int, default=3)
     return p.parse_args()
 
 
@@ -915,12 +937,57 @@ def eval_epoch(
     return metrics
 
 
-def build_train_loader(args: argparse.Namespace, train_transform: transforms.Compose):
+def build_pair_mining_config(args: argparse.Namespace) -> PairMiningConfig:
+    if args.use_pair_quality_mining:
+        exclude_low = not args.include_low_quality_positives
+        use_hard = not args.no_hard_negative_cache
+    else:
+        exclude_low = args.exclude_low_quality_positives and not args.include_low_quality_positives
+        use_hard = args.use_hard_negative_cache and not args.no_hard_negative_cache
+    return PairMiningConfig(
+        use_pair_quality_mining=args.use_pair_quality_mining,
+        pair_quality_cache_dir=args.pair_quality_cache_dir,
+        positive_quality_mode=args.positive_quality_mode,
+        positive_high_ratio=args.positive_high_ratio,
+        positive_medium_ratio=args.positive_medium_ratio,
+        exclude_low_quality_positives=exclude_low,
+        use_hard_negative_cache=use_hard,
+        hard_negative_ratio=args.hard_negative_ratio,
+        max_positive_candidates_per_anchor=args.max_positive_candidates_per_anchor,
+        max_negative_candidates_per_anchor=args.max_negative_candidates_per_anchor,
+    )
+
+
+def load_pair_quality_cache_for_training(args: argparse.Namespace) -> PairQualityCache | None:
+    if not args.use_pair_quality_mining:
+        return None
+    if args.pair_quality_cache_dir is None:
+        raise ValueError("--use_pair_quality_mining requires --pair_quality_cache_dir")
+    cache = PairQualityCache.load(args.pair_quality_cache_dir)
+    validate_cache_metadata(
+        cache.metadata,
+        data_root=args.train_data,
+        rdd_weights=args.rdd_weights,
+        lg_weights=args.lg_weights,
+        resize=args.resize,
+        top_k=args.top_k,
+    )
+    return cache
+
+
+def build_train_loader(
+    args: argparse.Namespace,
+    train_transform: transforms.Compose,
+    pair_quality_cache: PairQualityCache | None = None,
+    pair_mining_config: PairMiningConfig | None = None,
+):
     if args.batch_mode == "balanced":
         dataset = LabeledImageFolder(
             args.train_data,
             transform=train_transform,
             sequence_aware_sampling=args.sequence_aware_sampling,
+            pair_quality_cache=pair_quality_cache,
+            pair_mining_config=pair_mining_config,
         )
         sampler = BalancedBatchSampler(dataset, n_classes=args.n_classes, n_samples=args.n_samples_per_class)
         loader = get_loader(
@@ -938,6 +1005,8 @@ def build_train_loader(args: argparse.Namespace, train_transform: transforms.Com
         args.train_data,
         transform=train_transform,
         sequence_aware_sampling=args.sequence_aware_sampling,
+        pair_quality_cache=pair_quality_cache,
+        pair_mining_config=pair_mining_config,
     )
     loader = get_loader(
         dataset,
@@ -961,7 +1030,11 @@ def main() -> None:
     train_transform = build_train_transform(args)
     eval_transform = build_eval_transform()
 
-    train_train_ds, train_loader = build_train_loader(args, train_transform)
+    pair_mining_config = build_pair_mining_config(args)
+    pair_quality_cache = load_pair_quality_cache_for_training(args)
+    train_train_ds, train_loader = build_train_loader(
+        args, train_transform, pair_quality_cache, pair_mining_config
+    )
     train_triplet_eval_ds = TripletImageFolder(args.train_data, transform=eval_transform)
     val_ds = TripletImageFolder(args.val_data, transform=eval_transform)
 
@@ -1017,9 +1090,12 @@ def main() -> None:
     if accelerator.is_main_process:
         print(
             f"Starting training | train_data={args.train_data} | val_data={args.val_data} | "
-            f"resize={args.resize} | top_k={args.top_k} | batch_mode={args.batch_mode} | loss_type={args.loss_type}",
+            f"resize={args.resize} | top_k={args.top_k} | batch_mode={args.batch_mode} | loss_type={args.loss_type} | "
+            f"pair_quality_mining={args.use_pair_quality_mining} | retrieval_probe={args.use_retrieval_probe}",
             flush=True,
         )
+        if args.use_pair_quality_mining:
+            print(f"  pair_quality_cache_dir={args.pair_quality_cache_dir}", flush=True)
     for epoch in range(args.epochs):
         epoch_metrics, global_step = train_epoch(
             accelerator,
@@ -1041,6 +1117,37 @@ def main() -> None:
         lr = scheduler.get_last_lr()[0]
 
         metrics = {"epoch": epoch, "train/lr": lr, **epoch_metrics, **train_eval_metrics, **val_metrics}
+
+        if (
+            args.use_retrieval_probe
+            and accelerator.is_main_process
+            and (epoch + 1) % max(1, args.retrieval_probe_every_n_epochs) == 0
+        ):
+            _unwrap(rdd).eval()
+            lg.eval()
+            probe_metrics = run_retrieval_probe(
+                rdd,
+                lg,
+                args.train_data,
+                args.val_data,
+                device,
+                num_queries=args.retrieval_probe_num_queries,
+                gallery_per_id=args.retrieval_probe_gallery_per_id,
+                frames_per_seq=args.retrieval_probe_frames_per_seq,
+                top_m_pool=args.retrieval_probe_top_m_pool,
+                resize=args.resize,
+                top_k=args.top_k,
+                seed=args.seed,
+            )
+            rdd.train()
+            metrics.update(probe_metrics)
+            print(
+                f"  retrieval_probe: top1={probe_metrics['retrieval_probe/top1_acc']:.3f} "
+                f"top5={probe_metrics['retrieval_probe/top5_acc']:.3f} "
+                f"mAP={probe_metrics['retrieval_probe/mAP']:.3f} "
+                f"balanced_top1={probe_metrics['retrieval_probe/balanced_top1_acc']:.3f}",
+                flush=True,
+            )
         if accelerator.is_main_process:
             accelerator.log(metrics, step=epoch)
             print(

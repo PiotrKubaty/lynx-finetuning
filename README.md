@@ -5,15 +5,18 @@ Finetuning feature matching modules for better performance on lynx-reidentificat
 ## Instalation
 
 Clone RDD and change commit
+
 ```bash
 git clone --recursive https://github.com/xtcpete/rdd
 cd rdd
 git checkout 539508b270095969f9934c574cf7026bf37c434c
 cd .. # root directory
 ```
+
 Download `RDD-v2.pth` and `RDD_lg-v2.pth` checkpoints to rdd/weights
 
 Install packages
+
 ```bash
 conda create -n lynx-finetuning python=3.12
 conda activate lynx-finetuning
@@ -110,3 +113,122 @@ python rdd/scripts/lynx_eval_visuals.py \
   --sequence_aware_sampling true
 ```
 
+### `contrastive_finetuning/build_pair_quality_cache.py`
+
+Build an offline pair-quality cache using frozen baseline `RDD-v2 + RDD_lg-v2`.
+The cache scores sampled same-identity positives and cross-identity negatives per
+anchor image, then assigns quality bands (`high`, `medium`, `low`) used by the
+training loader when `--use_pair_quality_mining` is enabled.
+
+Output layout:
+
+```text
+<pair_quality_cache_dir>/
+  metadata.json
+  pairs.pt
+```
+
+Example:
+
+```bash
+python -m contrastive_finetuning.build_pair_quality_cache \
+  --train_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/train \
+  --output_dir /shared/sets/datasets/confidential/lynx/checkpoints/pair_quality_cache/baseline_v1 \
+  --rdd_weights rdd/weights/RDD-v2.pth \
+  --lg_weights rdd/weights/RDD_lg-v2.pth \
+  --resize 256 \
+  --top_k 256 \
+  --device cuda \
+  --max_positive_candidates_per_anchor 32 \
+  --max_negative_candidates_per_anchor 32 \
+  --sequence_aware_sampling true
+```
+
+Slurm launcher script:
+
+```bash
+sbatch build_pair_quality_cache.sh
+```
+
+Useful overrides:
+
+```bash
+# Smoke test on a subset of anchors
+MAX_ANCHORS=100 CACHE_TAG=baseline_v1_smoke sbatch build_pair_quality_cache.sh
+
+# Full run with explicit output directory
+OUTPUT_DIR=/shared/sets/datasets/confidential/lynx/checkpoints/pair_quality_cache/baseline_v1 \
+  sbatch build_pair_quality_cache.sh
+```
+
+Training with pair-quality mining (opt-in; fails fast if cache metadata mismatches
+`--train_data`, `--resize`, `--top_k`, or weight paths):
+
+```bash
+accelerate launch --num_processes 1 -m contrastive_finetuning.train \
+  --train_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/train \
+  --val_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/test \
+  --rdd_weights rdd/weights/RDD-v2.pth \
+  --lg_weights rdd/weights/RDD_lg-v2.pth \
+  --output_dir /tmp/lynx-mining-run \
+  --batch_mode balanced \
+  --loss_type batch_hard_topk \
+  --use_pair_quality_mining \
+  --pair_quality_cache_dir /shared/sets/datasets/confidential/lynx/checkpoints/pair_quality_cache/baseline_v1 \
+  --sequence_aware_sampling true \
+  --resize 256 \
+  --top_k 256
+```
+
+Optional benchmark-faithful retrieval probe during training (same scoring style as
+`rdd/scripts/lynx_benchmark.py`, on a fixed small subset):
+
+```bash
+accelerate launch --num_processes 1 -m contrastive_finetuning.train \
+  ... \
+  --use_retrieval_probe \
+  --retrieval_probe_num_queries 8 \
+  --retrieval_probe_gallery_per_id 2 \
+  --retrieval_probe_frames_per_seq 2 \
+  --retrieval_probe_every_n_epochs 1
+```
+
+Logs: `retrieval_probe/top1_acc`, `retrieval_probe/top5_acc`, `retrieval_probe/mAP`,
+`retrieval_probe/balanced_top1_acc`.
+
+Fallback behavior: if mining is enabled but a given anchor has no usable cached
+candidates, the loader falls back to the existing sequence-aware sampler.
+
+### `contrastive_finetuning/visualize_pair_quality_cache.py`
+
+Visualize pair-quality cache selections as side-by-side match panels, similar to
+`backfill_eval_visuals.py` and `lynx_eval_visuals.py`.
+
+For each sampled anchor, the script loads the cached **best high-quality positive**
+and **hardest negative** candidate (configurable), re-runs baseline RDD + LightGlue
+matching, and saves:
+
+```text
+pair_000_pos.jpg
+pair_000_neg.jpg
+...
+```
+
+Panel titles include cache metadata: quality band, composite score, cached match
+count, live match count, and anchor participation.
+
+Example:
+
+```bash
+python -m contrastive_finetuning.visualize_pair_quality_cache \
+  --cache_dir /shared/sets/datasets/confidential/lynx/checkpoints/pair_quality_cache/baseline_v1 \
+  --output_dir /shared/results/common/kargin/lynx/results/pair_quality_cache_visuals \
+  --num_examples 32 \
+  --seed 0 \
+  --device cuda \
+  --positive_selection best_high \
+  --negative_selection best_hard
+```
+
+Use `--positive_selection worst_low` to inspect low-quality same-identity pairs the
+miner would downweight or exclude.
