@@ -215,3 +215,7 @@ old_dataset
 
 # wandb
 wandb/
+
+# rdd
+rdd/
+rdd

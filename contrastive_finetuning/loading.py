@@ -2,67 +2,202 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
-from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision import transforms
+from torchvision.datasets import ImageFolder
 
-class TripletImageFolder(Dataset):
-    """ImageFolder wrapper that returns (anchor, positive, negative) triplets.
 
-    Positive is sampled randomly from the same class as the anchor,
-    negative from a randomly chosen different class.
+class RandomLike(Protocol):
+    def choice(self, seq): ...
+    def sample(self, population, k: int): ...
+    def shuffle(self, x): ...
+    def choices(self, population, k: int): ...
 
-    Args:
-        root: Path to the image folder root (class subdirectories expected).
-        transform: Transform applied to every image independently.
-        anchor_transform: Optional separate transform for the anchor image.
-    """
+
+@dataclass(frozen=True)
+class SampleMeta:
+    index: int
+    label: int
+    identity: str
+    source_id: str
+    sequence_id: str
+    path: Path
+
+
+class _SequenceAwareImageFolderBase:
+    def _init_sequence_metadata(self, root: str | Path, sequence_aware_sampling: bool) -> None:
+        self._root = Path(root)
+        self.sequence_aware_sampling = sequence_aware_sampling
+        self._sample_meta: list[SampleMeta] = []
+        self._class_to_indices: dict[int, list[int]] = defaultdict(list)
+        self._class_to_source_to_indices: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        self._class_to_source_sequence_to_indices: dict[int, dict[tuple[str, str], list[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+
+        for idx, (sample_path, label) in enumerate(self.samples):
+            path = Path(sample_path)
+            rel_parts = path.relative_to(self._root).parts
+            if len(rel_parts) < 4:
+                raise ValueError(
+                    "Expected dataset hierarchy identity/source/sequence/frame, "
+                    f"but got path '{path}' relative to '{self._root}'."
+                )
+            identity, source_id, sequence_id = rel_parts[0], rel_parts[1], rel_parts[2]
+            meta = SampleMeta(
+                index=idx,
+                label=label,
+                identity=identity,
+                source_id=source_id,
+                sequence_id=sequence_id,
+                path=path,
+            )
+            self._sample_meta.append(meta)
+            self._class_to_indices[label].append(idx)
+            self._class_to_source_to_indices[label][source_id].append(idx)
+            self._class_to_source_sequence_to_indices[label][(source_id, sequence_id)].append(idx)
+
+    def _sample_positive_index(self, index: int, rng: RandomLike | random.Random = random) -> int:
+        label = self.targets[index]
+        if not self.sequence_aware_sampling:
+            pos_pool = self._class_to_indices[label]
+            pos_idx = index
+            while pos_idx == index and len(pos_pool) > 1:
+                pos_idx = rng.choice(pos_pool)
+            return pos_idx
+
+        meta = self._sample_meta[index]
+        source_groups = self._class_to_source_to_indices[label]
+        sequence_groups = self._class_to_source_sequence_to_indices[label]
+
+        cross_source = [
+            candidate
+            for source_id, indices in source_groups.items()
+            if source_id != meta.source_id
+            for candidate in indices
+        ]
+        if cross_source:
+            return rng.choice(cross_source)
+
+        cross_sequence = [
+            candidate
+            for (source_id, sequence_id), indices in sequence_groups.items()
+            if source_id == meta.source_id and sequence_id != meta.sequence_id
+            for candidate in indices
+        ]
+        if cross_sequence:
+            return rng.choice(cross_sequence)
+
+        same_sequence = [
+            candidate
+            for candidate in sequence_groups[(meta.source_id, meta.sequence_id)]
+            if candidate != index
+        ]
+        if same_sequence:
+            return rng.choice(same_sequence)
+        return index
+
+    def _sample_negative_index(self, label: int, rng: RandomLike | random.Random = random) -> int:
+        neg_label = label
+        while neg_label == label:
+            neg_label = rng.choice(list(self._class_to_indices.keys()))
+        return rng.choice(self._class_to_indices[neg_label])
+
+    def _sequence_diverse_indices(self, label: int, n_samples: int, rng: RandomLike | random.Random = random) -> list[int]:
+        if not self.sequence_aware_sampling:
+            pool = self._class_to_indices[label]
+            return rng.choices(pool, k=n_samples) if len(pool) < n_samples else rng.sample(pool, n_samples)
+
+        source_groups = {
+            source_id: indices.copy() for source_id, indices in self._class_to_source_to_indices[label].items()
+        }
+        sequence_groups = {
+            key: indices.copy() for key, indices in self._class_to_source_sequence_to_indices[label].items()
+        }
+        for indices in source_groups.values():
+            rng.shuffle(indices)
+        for indices in sequence_groups.values():
+            rng.shuffle(indices)
+
+        selected: list[int] = []
+        used_sources: set[str] = set()
+        used_sequences: set[tuple[str, str]] = set()
+
+        source_keys = list(source_groups.keys())
+        rng.shuffle(source_keys)
+        for source_id in source_keys:
+            if len(selected) >= n_samples:
+                break
+            indices = source_groups[source_id]
+            if indices:
+                choice = indices.pop()
+                selected.append(choice)
+                meta = self._sample_meta[choice]
+                used_sources.add(meta.source_id)
+                used_sequences.add((meta.source_id, meta.sequence_id))
+
+        sequence_keys = list(sequence_groups.keys())
+        rng.shuffle(sequence_keys)
+        for key in sequence_keys:
+            if len(selected) >= n_samples:
+                break
+            if key in used_sequences:
+                continue
+            indices = sequence_groups[key]
+            remaining = [idx for idx in indices if idx not in selected]
+            if remaining:
+                choice = remaining.pop()
+                selected.append(choice)
+                meta = self._sample_meta[choice]
+                used_sources.add(meta.source_id)
+                used_sequences.add((meta.source_id, meta.sequence_id))
+
+        unique_remaining = [idx for idx in self._class_to_indices[label] if idx not in selected]
+        rng.shuffle(unique_remaining)
+        while unique_remaining and len(selected) < n_samples:
+            selected.append(unique_remaining.pop())
+
+        if len(selected) < n_samples:
+            pool = self._class_to_indices[label]
+            selected.extend(rng.choices(pool, k=n_samples - len(selected)))
+        return selected
+
+
+class TripletImageFolder(_SequenceAwareImageFolderBase, Dataset):
+    """ImageFolder wrapper that returns (anchor, positive, negative) triplets."""
 
     def __init__(
         self,
         root: str | Path,
         transform: transforms.Compose | None = None,
         anchor_transform: transforms.Compose | None = None,
+        sequence_aware_sampling: bool = False,
     ) -> None:
         self._base = ImageFolder(root=str(root), transform=None)
         self.transform = transform
         self.anchor_transform = anchor_transform or transform
-
-        # Build per-class index lists for fast sampling
-        self._class_to_indices: dict[int, list[int]] = defaultdict(list)
-        for idx, (_, label) in enumerate(self._base.samples):
-            self._class_to_indices[label].append(idx)
-
+        self.samples = self._base.samples
+        self.targets = self._base.targets
         self.classes = self._base.classes
         self.class_to_idx = self._base.class_to_idx
+        self._init_sequence_metadata(root, sequence_aware_sampling=sequence_aware_sampling)
 
     def __len__(self) -> int:
         return len(self._base)
 
-    def _load(self, idx: int) -> torch.Tensor:
+    def _load(self, idx: int):
         path, _ = self._base.samples[idx]
-        img = self._base.loader(path)
-        return img
+        return self._base.loader(path)
 
-    def __getitem__(
-        self, index: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         anchor_label = self._base.targets[index]
-
-        # Positive: different index, same class
-        pos_pool = self._class_to_indices[anchor_label]
-        pos_idx = index
-        while pos_idx == index and len(pos_pool) > 1:
-            pos_idx = random.choice(pos_pool)
-
-        # Negative: random different class
-        neg_label = anchor_label
-        while neg_label == anchor_label:
-            neg_label = random.choice(list(self._class_to_indices.keys()))
-        neg_idx = random.choice(self._class_to_indices[neg_label])
+        pos_idx = self._sample_positive_index(index)
+        neg_idx = self._sample_negative_index(anchor_label)
 
         anchor_img = self._load(index)
         pos_img = self._load(pos_idx)
@@ -73,37 +208,21 @@ class TripletImageFolder(Dataset):
         if self.transform is not None:
             pos_img = self.transform(pos_img)
             neg_img = self.transform(neg_img)
-
         return anchor_img, pos_img, neg_img
 
 
 class FixedTripletDataset(Dataset):
-    """Deterministic triplet dataset: triplets are pre-sampled once at construction.
-
-    Uses a private `random.Random` instance so it never pollutes global RNG state
-    and always produces the same triplets regardless of training state.
-    """
+    """Deterministic triplet dataset: triplets are pre-sampled once at construction."""
 
     def __init__(self, base: TripletImageFolder, n_samples: int, seed: int = 42) -> None:
         rng = random.Random(seed)
         self._base = base
-
         anchor_indices = rng.sample(range(len(base)), min(n_samples, len(base)))
-
         self._triplets: list[tuple[int, int, int]] = []
         for anchor_idx in anchor_indices:
             anchor_label = base._base.targets[anchor_idx]
-
-            pos_pool = base._class_to_indices[anchor_label]
-            pos_idx = anchor_idx
-            while pos_idx == anchor_idx and len(pos_pool) > 1:
-                pos_idx = rng.choice(pos_pool)
-
-            neg_label = anchor_label
-            while neg_label == anchor_label:
-                neg_label = rng.choice(list(base._class_to_indices.keys()))
-            neg_idx = rng.choice(base._class_to_indices[neg_label])
-
+            pos_idx = base._sample_positive_index(anchor_idx, rng=rng)
+            neg_idx = base._sample_negative_index(anchor_label, rng=rng)
             self._triplets.append((anchor_idx, pos_idx, neg_idx))
 
     def __len__(self) -> int:
@@ -112,71 +231,52 @@ class FixedTripletDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         anchor_idx, pos_idx, neg_idx = self._triplets[index]
         base = self._base
-
         anchor_img = base._load(anchor_idx)
-        pos_img    = base._load(pos_idx)
-        neg_img    = base._load(neg_idx)
-
+        pos_img = base._load(pos_idx)
+        neg_img = base._load(neg_idx)
         if base.anchor_transform is not None:
             anchor_img = base.anchor_transform(anchor_img)
         if base.transform is not None:
             pos_img = base.transform(pos_img)
             neg_img = base.transform(neg_img)
-
         return anchor_img, pos_img, neg_img
 
 
-class LabeledImageFolder(ImageFolder):
-    """Plain ImageFolder that returns (image, label) pairs.
-
-    Suitable for online triplet/contrastive mining where the loss function
-    constructs pairs/triplets from a regular labeled batch.
-    """
+class LabeledImageFolder(_SequenceAwareImageFolderBase, ImageFolder):
+    """Plain ImageFolder that returns (image, label) pairs."""
 
     def __init__(
         self,
         root: str | Path,
         transform: transforms.Compose | None = None,
+        sequence_aware_sampling: bool = False,
     ) -> None:
         super().__init__(root=str(root), transform=transform)
+        self._init_sequence_metadata(root, sequence_aware_sampling=sequence_aware_sampling)
 
 
-class BalancedBatchSampler(Sampler):
-    """Yields batches with exactly `n_classes` classes and `n_samples` per class.
-
-    Commonly used with online triplet/contrastive loss to guarantee that every
-    batch contains enough positives to mine from.
-
-    Args:
-        labels: Sequence of integer class labels, one per dataset item.
-        n_classes: Number of distinct classes per batch.
-        n_samples: Number of samples per class per batch.
-    """
+class BalancedBatchSampler(Sampler[list[int]]):
+    """Yields batches with exactly `n_classes` classes and `n_samples` per class."""
 
     def __init__(
         self,
-        labels: list[int],
+        dataset: LabeledImageFolder,
         n_classes: int,
         n_samples: int,
     ) -> None:
         super().__init__()
+        self.dataset = dataset
         self.n_classes = n_classes
         self.n_samples = n_samples
         self.batch_size = n_classes * n_samples
-
-        self._class_to_indices: dict[int, list[int]] = defaultdict(list)
-        for idx, label in enumerate(labels):
-            self._class_to_indices[label].append(idx)
-
-        self._classes = list(self._class_to_indices.keys())
+        self._classes = list(dataset._class_to_indices.keys())
         if len(self._classes) < n_classes:
             raise ValueError(
-                f"Dataset has only {len(self._classes)} classes, "
-                f"but n_classes={n_classes} was requested."
+                f"Dataset has only {len(self._classes)} classes, but n_classes={n_classes} was requested."
             )
-
-        # Number of batches: how many times we can cycle through all classes
-        self._n_batches = len(labels) // self.batch_size
+        if n_samples < 2:
+            raise ValueError("BalancedBatchSampler requires n_samples >= 2 to form positive pairs.")
+        self._n_batches = max(len(dataset.targets) // self.batch_size, 1)
 
     def __len__(self) -> int:
         return self._n_batches
@@ -186,13 +286,7 @@ class BalancedBatchSampler(Sampler):
             chosen_classes = random.sample(self._classes, self.n_classes)
             batch: list[int] = []
             for cls in chosen_classes:
-                pool = self._class_to_indices[cls]
-                # Sample with replacement if the class has fewer than n_samples images
-                batch.extend(
-                    random.choices(pool, k=self.n_samples)
-                    if len(pool) < self.n_samples
-                    else random.sample(pool, self.n_samples)
-                )
+                batch.extend(self.dataset._sequence_diverse_indices(cls, self.n_samples))
             yield batch
 
 
@@ -202,20 +296,25 @@ def get_loader(
     shuffle: bool = True,
     num_workers: int = 16,
     pin: bool = True,
-    persistent_workers=True,
+    persistent_workers: bool = True,
     seed: int | None = None,
+    batch_sampler: Sampler[list[int]] | None = None,
 ):
     generator = None
     if seed is not None:
         generator = torch.Generator()
         generator.manual_seed(seed)
-    loader = DataLoader(
-        dataset=data,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        pin_memory=pin,
-        num_workers=num_workers,
-        persistent_workers=persistent_workers,
-        generator=generator,
-    )
-    return loader
+
+    loader_kwargs = {
+        "dataset": data,
+        "pin_memory": pin,
+        "num_workers": num_workers,
+        "persistent_workers": persistent_workers and num_workers > 0,
+        "generator": generator,
+    }
+    if batch_sampler is not None:
+        loader_kwargs["batch_sampler"] = batch_sampler
+    else:
+        loader_kwargs["batch_size"] = batch_size
+        loader_kwargs["shuffle"] = shuffle
+    return DataLoader(**loader_kwargs)
