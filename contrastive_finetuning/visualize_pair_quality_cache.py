@@ -115,12 +115,12 @@ def match_pair_visual(
     feat_b: dict,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
-    k0 = torch.from_numpy(feat_a["keypoints"]).to(device).unsqueeze(0)
-    k1 = torch.from_numpy(feat_b["keypoints"]).to(device).unsqueeze(0)
-    d0 = torch.from_numpy(feat_a["descriptors"]).to(device).unsqueeze(0)
-    d1 = torch.from_numpy(feat_b["descriptors"]).to(device).unsqueeze(0)
-    size0 = torch.tensor(feat_a["image_size"][::-1].copy(), device=device).unsqueeze(0)
-    size1 = torch.tensor(feat_b["image_size"][::-1].copy(), device=device).unsqueeze(0)
+    k0 = feat_a["keypoints"].to(device, non_blocking=True).unsqueeze(0)
+    k1 = feat_b["keypoints"].to(device, non_blocking=True).unsqueeze(0)
+    d0 = feat_a["descriptors"].to(device, non_blocking=True).unsqueeze(0)
+    d1 = feat_b["descriptors"].to(device, non_blocking=True).unsqueeze(0)
+    size0 = feat_a["image_size_wh"].to(device, non_blocking=True).unsqueeze(0)
+    size1 = feat_b["image_size_wh"].to(device, non_blocking=True).unsqueeze(0)
 
     pred = lg(
         {
@@ -134,8 +134,8 @@ def match_pair_visual(
         empty = np.empty((0, 2), dtype=np.float32)
         return empty, empty, np.empty((0,), dtype=np.float32), 0, 0.0
 
-    kpts0 = feat_a["keypoints"][matches[:, 0].cpu().numpy()]
-    kpts1 = feat_b["keypoints"][matches[:, 1].cpu().numpy()]
+    kpts0 = feat_a["keypoints"][matches[:, 0].cpu()].numpy()
+    kpts1 = feat_b["keypoints"][matches[:, 1].cpu()].numpy()
     conf = scores.detach().cpu().numpy()
     return kpts0, kpts1, conf, int(len(conf)), float(conf.mean())
 

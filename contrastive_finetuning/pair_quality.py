@@ -220,45 +220,33 @@ class PairQualityCache:
         self,
         anchor_idx: int,
         dataset_base: Any,
+        *,
+        tier_name: str,
         bands: tuple[str, ...] | None = None,
         exclude_low: bool = False,
+        used_indices: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         anchor_meta = dataset_base._sample_meta[anchor_idx]
-        label = dataset_base.targets[anchor_idx]
         all_candidates = self.positive_candidates_by_anchor.get(anchor_idx, [])
+        used_indices = used_indices or set()
 
         def match_band(c: dict[str, Any]) -> bool:
+            candidate_idx = int(c.get("candidate_index", -1))
+            if candidate_idx == anchor_idx or candidate_idx in used_indices:
+                return False
             if bands is not None and c.get("quality_band") not in bands:
                 return False
             if exclude_low and c.get("quality_band") == "low":
                 return False
-            return True
+            if tier_name == "cross_source":
+                return c.get("source_id") != anchor_meta.source_id
+            if tier_name == "cross_sequence":
+                return c.get("source_id") == anchor_meta.source_id and c.get("sequence_id") != anchor_meta.sequence_id
+            if tier_name == "same_sequence":
+                return c.get("source_id") == anchor_meta.source_id and c.get("sequence_id") == anchor_meta.sequence_id
+            raise ValueError(f"unknown positive tier {tier_name!r}")
 
-        cross_source = [
-            c
-            for c in all_candidates
-            if c.get("source_id") != anchor_meta.source_id and match_band(c)
-        ]
-        cross_sequence = [
-            c
-            for c in all_candidates
-            if c.get("source_id") == anchor_meta.source_id
-            and c.get("sequence_id") != anchor_meta.sequence_id
-            and match_band(c)
-        ]
-        same_sequence = [
-            c
-            for c in all_candidates
-            if c.get("source_id") == anchor_meta.source_id
-            and c.get("sequence_id") == anchor_meta.sequence_id
-            and int(c.get("candidate_index", -1)) != anchor_idx
-            and match_band(c)
-        ]
-
-        for tier in (cross_source, cross_sequence, same_sequence):
-            if tier:
-                return tier
-        return []
+        return [c for c in all_candidates if match_band(c)]
 
     def sample_positive_index(
         self,
@@ -268,11 +256,29 @@ class PairQualityCache:
         config: PairMiningConfig,
     ) -> int | None:
         exclude_low = config.exclude_low_quality_positives
-        for bands in (("high",), ("medium",), ("low",)):
-            if exclude_low and bands == ("low",):
-                continue
+        ordered_groups = [
+            ("cross_source", ("high",)),
+            ("cross_sequence", ("high",)),
+            ("cross_source", ("medium",)),
+            ("cross_sequence", ("medium",)),
+            ("same_sequence", ("high", "medium")),
+        ]
+        if not exclude_low:
+            ordered_groups.extend(
+                [
+                    ("cross_source", ("low",)),
+                    ("cross_sequence", ("low",)),
+                    ("same_sequence", ("low",)),
+                ]
+            )
+
+        for tier_name, bands in ordered_groups:
             tier_candidates = self._structural_positive_candidates(
-                anchor_idx, dataset_base, bands=bands, exclude_low=exclude_low
+                anchor_idx,
+                dataset_base,
+                tier_name=tier_name,
+                bands=bands,
+                exclude_low=exclude_low,
             )
             picked = self._pick_from_candidates(tier_candidates, rng, config)
             if picked is not None:
@@ -312,14 +318,52 @@ class PairQualityCache:
 
         selected = [seed_idx]
         used = {seed_idx}
+        exclude_low = config.exclude_low_quality_positives
+        ordered_groups = [
+            ("cross_source", ("high",)),
+            ("cross_sequence", ("high",)),
+            ("cross_source", ("medium",)),
+            ("cross_sequence", ("medium",)),
+            ("same_sequence", ("high", "medium")),
+        ]
+        if not exclude_low:
+            ordered_groups.extend(
+                [
+                    ("cross_source", ("low",)),
+                    ("cross_sequence", ("low",)),
+                    ("same_sequence", ("low",)),
+                ]
+            )
 
-        while len(selected) < n_samples:
-            picked_idx = self.sample_positive_index(seed_idx, dataset_base, rng, config)
-            if picked_idx is None or picked_idx in used:
-                break
-            selected.append(picked_idx)
-            used.add(picked_idx)
+        for tier_name, bands in ordered_groups:
+            candidates = self._structural_positive_candidates(
+                seed_idx,
+                dataset_base,
+                tier_name=tier_name,
+                bands=bands,
+                exclude_low=exclude_low,
+                used_indices=used,
+            )
+            if not candidates:
+                continue
+            if config.positive_quality_mode == "random":
+                rng.shuffle(candidates)
+            elif config.positive_quality_mode == "bucketed":
+                high = [c for c in candidates if c.get("quality_band") == "high"]
+                medium = [c for c in candidates if c.get("quality_band") == "medium"]
+                low = [c for c in candidates if c.get("quality_band") == "low"]
+                rng.shuffle(high)
+                rng.shuffle(medium)
+                rng.shuffle(low)
+                candidates = high + medium + low
+            while candidates and len(selected) < n_samples:
+                picked = candidates.pop(0)
+                picked_idx = int(picked["candidate_index"])
+                if picked_idx in used:
+                    continue
+                selected.append(picked_idx)
+                used.add(picked_idx)
+            if len(selected) >= n_samples:
+                return selected[:n_samples]
 
-        if len(selected) >= n_samples:
-            return selected[:n_samples]
         return None

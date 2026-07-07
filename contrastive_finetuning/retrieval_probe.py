@@ -254,12 +254,18 @@ def run_retrieval_probe(
             "retrieval_probe/balanced_top1_acc": 0.0,
         }
 
+    seq_feat_cache: dict[str, list[FrameFeat]] = {}
+
     def load_seq_feats(seq: SequenceEntry) -> list[FrameFeat]:
+        cached = seq_feat_cache.get(seq.name)
+        if cached is not None:
+            return cached
         frames = sample_frames(seq.frame_paths, frames_per_seq)
         feats = []
         for fp in frames:
             img = load_image_tensor(fp, resize)
             feats.append(extract_frame_feat(rdd, img, device, top_k))
+        seq_feat_cache[seq.name] = feats
         return feats
 
     query_records = []

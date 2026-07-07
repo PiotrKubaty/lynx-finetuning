@@ -113,12 +113,90 @@ python rdd/scripts/lynx_eval_visuals.py \
   --sequence_aware_sampling true
 ```
 
+### `rdd/scripts/lynx_benchmark.py` and `rdd_benchmark.sh`
+
+Run the sequence-level lynx retrieval benchmark either with the original
+`RDD-v2` checkpoint or with one of the fine-tuned descriptor checkpoints from
+this repository.
+
+The Slurm launcher is:
+
+```bash
+sbatch rdd_benchmark.sh
+```
+
+#### Benchmark with the original RDD checkpoint
+
+This uses the stock `RDD-v2.pth` descriptor and frozen `RDD_lg-v2.pth`
+LightGlue weights.
+
+Example:
+
+```bash
+CACHE_DIR=/shared/results/common/kargin/lynx/results/rdd/cache_baseline \
+DUMP_REPORT=/shared/results/common/kargin/lynx/results/rdd/lynx_report_baseline \
+METRICS_PLOT=/shared/results/common/kargin/lynx/results/rdd/lynx_metrics_baseline \
+sbatch rdd_benchmark.sh
+```
+
+Useful overrides:
+
+```bash
+FRAMES_PER_SEQ=2 TOP_K=2048 RESIZE_MAX=448 sbatch rdd_benchmark.sh
+```
+
+#### Benchmark with a fine-tuned checkpoint
+
+`lynx_benchmark.py` currently expects `--weights` to be a PyTorch
+`state_dict` file loadable via `torch.load(...)`. Fine-tuning checkpoints are
+saved as:
+
+```text
+<run_dir>/epoch_XX/model.safetensors
+```
+
+So convert the checkpoint once to `model.pth` first:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import torch
+from safetensors.torch import load_file
+
+src = Path("/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/<run_tag>/<run_id>/epoch_XX/model.safetensors")
+dst = src.with_name("model.pth")
+
+state = load_file(str(src))
+torch.save(state, str(dst))
+print(dst)
+PY
+```
+
+Then benchmark the converted file:
+
+```bash
+WEIGHTS=/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/<run_tag>/<run_id>/epoch_XX/model.pth \
+CACHE_DIR=/shared/results/common/kargin/lynx/results/rdd/cache_<run_tag>_epochXX \
+DUMP_REPORT=/shared/results/common/kargin/lynx/results/rdd/lynx_report_<run_tag>_epochXX \
+METRICS_PLOT=/shared/results/common/kargin/lynx/results/rdd/lynx_metrics_<run_tag>_epochXX \
+sbatch rdd_benchmark.sh
+```
+
+Important:
+
+- use a fresh `CACHE_DIR` for each checkpoint; otherwise cached baseline
+  features may be reused and the benchmark will not reflect the fine-tuned
+  model
+- only the RDD descriptor weights change; LightGlue remains the baseline
+  `RDD_lg-v2.pth`
+
 ### `contrastive_finetuning/build_pair_quality_cache.py`
 
 Build an offline pair-quality cache using frozen baseline `RDD-v2 + RDD_lg-v2`.
 The cache scores sampled same-identity positives and cross-identity negatives per
-anchor image, then assigns quality bands (`high`, `medium`, `low`) used by the
-training loader when `--use_pair_quality_mining` is enabled.
+anchor image with batched `LightGlueMasked`, then assigns quality bands (`high`,
+`medium`, `low`) used by the training loader when `--use_pair_quality_mining` is
+enabled.
 
 Output layout:
 
@@ -141,7 +219,8 @@ python -m contrastive_finetuning.build_pair_quality_cache \
   --device cuda \
   --max_positive_candidates_per_anchor 32 \
   --max_negative_candidates_per_anchor 32 \
-  --sequence_aware_sampling true
+  --sequence_aware_sampling true \
+  --lg_batch_size 16
 ```
 
 Slurm launcher script:
@@ -156,10 +235,20 @@ Useful overrides:
 # Smoke test on a subset of anchors
 MAX_ANCHORS=100 CACHE_TAG=baseline_v1_smoke sbatch build_pair_quality_cache.sh
 
+# High-throughput H100 run (default LG_BATCH_SIZE=16)
+LG_BATCH_SIZE=16 sbatch build_pair_quality_cache.sh
+
+# Conservative fallback if OOM or for debugging parity
+LG_BATCH_SIZE=1 DISABLE_LG_BATCHING=true sbatch build_pair_quality_cache.sh
+
 # Full run with explicit output directory
 OUTPUT_DIR=/shared/sets/datasets/confidential/lynx/checkpoints/pair_quality_cache/baseline_v1 \
   sbatch build_pair_quality_cache.sh
 ```
+
+`LG_BATCH_SIZE` controls how many candidate pairs are scored in one LightGlue forward
+pass per anchor. On OOM, the builder automatically retries with smaller micro-batches
+down to size 1.
 
 Training with pair-quality mining (opt-in; fails fast if cache metadata mismatches
 `--train_data`, `--resize`, `--top_k`, or weight paths):
