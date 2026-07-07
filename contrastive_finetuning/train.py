@@ -76,8 +76,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_match_proxy", action="store_true")
     p.add_argument("--match_proxy_weight", type=float, default=0.1)
     p.add_argument("--match_proxy_pairs_per_batch", type=int, default=2)
-    p.add_argument("--aug_profile", choices=["none", "local_corr_v1"], default="none")
+    p.add_argument("--aug_profile", choices=["none", "local_corr_v1", "benchmark_aligned_v1"], default="none")
     p.add_argument("--use_center_bias_crop", action="store_true")
+    p.add_argument("--resize_policy", choices=["legacy", "benchmark_aligned"], default="legacy")
     p.add_argument("--save_eval_visuals", action="store_true")
     p.add_argument("--num_eval_visuals", type=int, default=4)
     p.add_argument("--eval_metrics_profile", choices=["basic", "extended"], default="basic")
@@ -177,6 +178,17 @@ def build_train_transform(args: argparse.Namespace) -> transforms.Compose:
                 AddGaussianNoise(std=0.01),
             ]
         )
+    elif args.aug_profile == "benchmark_aligned_v1":
+        if args.use_center_bias_crop:
+            ops.append(CenterBiasedCrop(scale_range=(0.92, 1.0), jitter=0.03))
+        ops.extend(
+            [
+                transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.08, hue=0.03),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.2))], p=0.2),
+                transforms.ToTensor(),
+                AddGaussianNoise(std=0.01),
+            ]
+        )
     else:
         if args.use_center_bias_crop:
             ops.extend([CenterBiasedCrop(scale_range=(0.9, 1.0), jitter=0.04), transforms.Resize((args.resize, args.resize), antialias=True)])
@@ -198,6 +210,22 @@ def resize_long_side(images: torch.Tensor, size: int) -> torch.Tensor:
     new_h = max(32, int(h * scale) // 32 * 32)
     new_w = max(32, int(w * scale) // 32 * 32)
     return F.interpolate(images.float(), (new_h, new_w), mode="bilinear", align_corners=False)
+
+
+def resize_long_side_no_upscale(images: torch.Tensor, size: int) -> torch.Tensor:
+    _, _, h, w = images.shape
+    if max(h, w) <= size:
+        return images.float()
+    scale = size / max(h, w)
+    new_h = max(32, int(h * scale) // 32 * 32)
+    new_w = max(32, int(w * scale) // 32 * 32)
+    return F.interpolate(images.float(), (new_h, new_w), mode="bilinear", align_corners=False)
+
+
+def resize_for_rdd(images: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    if args.resize_policy == "benchmark_aligned":
+        return resize_long_side_no_upscale(images, args.resize)
+    return resize_long_side(images, args.resize)
 
 
 def batch_features(feats: list[dict], image_h: int, image_w: int) -> dict:
@@ -631,7 +659,7 @@ def compute_loss_breakdown(
     if args.batch_mode == "balanced":
         images, labels = batch
         labels = labels.to(device)
-        images_r = resize_long_side(images, args.resize).to(device)
+        images_r = resize_for_rdd(images, args).to(device)
         feats = extract_train(rdd, images_r)
 
         if args.loss_type == "triplet":
@@ -661,9 +689,9 @@ def compute_loss_breakdown(
         return LossBreakdown(total=total_loss, main=main_loss, coverage=coverage_loss, proxy=proxy_loss)
 
     anchors, positives, negatives = batch
-    anchors_r = resize_long_side(anchors, args.resize).to(device)
-    positives_r = resize_long_side(positives, args.resize).to(device)
-    negatives_r = resize_long_side(negatives, args.resize).to(device)
+    anchors_r = resize_for_rdd(anchors, args).to(device)
+    positives_r = resize_for_rdd(positives, args).to(device)
+    negatives_r = resize_for_rdd(negatives, args).to(device)
     feats_a = extract_train(rdd, anchors_r)
     feats_p = extract_train(rdd, positives_r)
     feats_n = extract_train(rdd, negatives_r)
@@ -778,7 +806,7 @@ def train_epoch(
                     f"step_time={step_time:.2f}s"
                 )
 
-        if (step + 1) % 100 == 0:
+        if (step + 1) % 1000 == 0:
             mini_train_m = eval_epoch(accelerator, rdd, lg, mini_train_loader, args, prefix="mini_train", epoch=epoch)
             mini_val_m = eval_epoch(accelerator, rdd, lg, mini_val_loader, args, prefix="mini_val", epoch=epoch)
             rdd.train()
@@ -824,9 +852,9 @@ def eval_epoch(
     visuals_dir = args.output_dir / f"{prefix}_visuals" / f"epoch_{epoch:02d}"
 
     for anchors, positives, negatives in loader:
-        anchors_r = resize_long_side(anchors, args.resize).to(device)
-        positives_r = resize_long_side(positives, args.resize).to(device)
-        negatives_r = resize_long_side(negatives, args.resize).to(device)
+        anchors_r = resize_for_rdd(anchors, args).to(device)
+        positives_r = resize_for_rdd(positives, args).to(device)
+        negatives_r = resize_for_rdd(negatives, args).to(device)
         h_r, w_r = anchors_r.shape[-2:]
 
         feats_a = extract_train(_unwrap(rdd), anchors_r)

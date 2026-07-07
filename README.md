@@ -269,6 +269,45 @@ accelerate launch --num_processes 1 -m contrastive_finetuning.train \
   --top_k 256
 ```
 
+Benchmark-aligned augmentation and resize options:
+
+- `--aug_profile benchmark_aligned_v1`
+  keeps mild photometric augmentation while removing the current
+  `RandomResizedCrop`-based geometry changes from the recommended path
+- `--resize_policy benchmark_aligned`
+  preserves aspect ratio, downsizes only when the long side is larger than
+  `--resize`, and does not upscale smaller images
+- `--resize_policy legacy`
+  keeps the previous behavior for backward-compatible ablations
+
+Recommended benchmark-aligned run shape:
+
+```bash
+accelerate launch --num_processes 1 -m contrastive_finetuning.train \
+  --train_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/train \
+  --val_data /shared/sets/datasets/confidential/lynx/processed_frames/segmented/dfk-June-2026-merged/lynx/test \
+  --rdd_weights rdd/weights/RDD-v2.pth \
+  --lg_weights rdd/weights/RDD_lg-v2.pth \
+  --output_dir /tmp/lynx-benchmark-aligned-run \
+  --batch_mode balanced \
+  --loss_type batch_hard_topk \
+  --aug_profile benchmark_aligned_v1 \
+  --resize_policy benchmark_aligned \
+  --resize 512 \
+  --top_k 512
+```
+
+Suggested augmentation ablations:
+
+- `--aug_profile none --resize_policy benchmark_aligned`
+  for no augmentation beyond benchmark-aligned resizing
+- `--aug_profile benchmark_aligned_v1 --resize_policy benchmark_aligned`
+  for photometric-only augmentation
+- `--aug_profile benchmark_aligned_v1 --resize_policy benchmark_aligned --use_center_bias_crop`
+  for conservative geometry + photometric augmentation
+- `--aug_profile local_corr_v1 --resize_policy legacy`
+  for the older crop-heavy baseline
+
 Optional benchmark-faithful retrieval probe during training (same scoring style as
 `rdd/scripts/lynx_benchmark.py`, on a fixed small subset):
 

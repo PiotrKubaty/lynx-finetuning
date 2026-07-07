@@ -18,7 +18,8 @@ def _load_lightglue_class():
     return module.LightGlue
 
 def build_rdd(weights: Path, device: torch.device, top_k: int):
-    rdd_conf = read_config("rdd/configs/default.yaml")
+    repo_root = Path(__file__).resolve().parents[1]
+    rdd_conf = read_config(str(repo_root / "rdd" / "configs" / "default.yaml"))
     rdd_conf["device"] = str(device)
     model = build(rdd_conf, weights=str(weights))
     model.top_k = top_k
