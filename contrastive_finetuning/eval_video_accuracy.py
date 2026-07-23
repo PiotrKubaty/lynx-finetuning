@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
 from accelerate import Accelerator
 from torchvision import transforms
 
@@ -42,7 +43,8 @@ def main() -> None:
     accelerator = Accelerator()
     device = accelerator.device
 
-    ds = IndexAssignedTripletDataset(args.index, root=args.data_root, transform=transforms.ToTensor())
+    transform = transforms.ToTensor()
+    ds = IndexAssignedTripletDataset(args.index, root=args.data_root, transform=transform)
 
     rdd = build_rdd(args.rdd_weights, device, args.top_k)
     lg  = build_masked_lg(device, weights=args.lg_weights)
