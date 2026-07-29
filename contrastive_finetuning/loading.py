@@ -6,128 +6,9 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
-from torchvision.datasets import ImageFolder
+from torch.utils.data import Dataset, DataLoader
 from torchvision.datasets.folder import default_loader
 from torchvision import transforms
-from tqdm import tqdm
-
-class TripletImageFolder(Dataset):
-    """ImageFolder wrapper that returns (anchor, positive, negative) triplets.
-
-    Positive is sampled randomly from the same class as the anchor,
-    negative from a randomly chosen different class.
-
-    Args:
-        root: Path to the image folder root (class subdirectories expected).
-        transform: Transform applied to every image independently.
-        anchor_transform: Optional separate transform for the anchor image.
-    """
-
-    def __init__(
-        self,
-        root: str | Path,
-        transform: transforms.Compose | None = None,
-        anchor_transform: transforms.Compose | None = None,
-    ) -> None:
-        self._base = ImageFolder(root=str(root), transform=None)
-        self.transform = transform
-        self.anchor_transform = anchor_transform or transform
-
-        # Build per-class index lists for fast sampling
-        self._class_to_indices: dict[int, list[int]] = defaultdict(list)
-        for idx, (_, label) in enumerate(self._base.samples):
-            self._class_to_indices[label].append(idx)
-
-        self.classes = self._base.classes
-        self.class_to_idx = self._base.class_to_idx
-
-    def __len__(self) -> int:
-        return len(self._base)
-
-    def _load(self, idx: int) -> torch.Tensor:
-        path, _ = self._base.samples[idx]
-        img = self._base.loader(path)
-        return img
-
-    def __getitem__(
-        self, index: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        anchor_label = self._base.targets[index]
-
-        # Positive: different index, same class
-        pos_pool = self._class_to_indices[anchor_label]
-        pos_idx = index
-        while pos_idx == index and len(pos_pool) > 1:
-            pos_idx = random.choice(pos_pool)
-
-        # Negative: random different class
-        neg_label = anchor_label
-        while neg_label == anchor_label:
-            neg_label = random.choice(list(self._class_to_indices.keys()))
-        neg_idx = random.choice(self._class_to_indices[neg_label])
-
-        anchor_img = self._load(index)
-        pos_img = self._load(pos_idx)
-        neg_img = self._load(neg_idx)
-
-        if self.anchor_transform is not None:
-            anchor_img = self.anchor_transform(anchor_img)
-        if self.transform is not None:
-            pos_img = self.transform(pos_img)
-            neg_img = self.transform(neg_img)
-
-        return anchor_img, pos_img, neg_img
-
-
-class FixedTripletDataset(Dataset):
-    """Deterministic triplet dataset: triplets are pre-sampled once at construction.
-
-    Uses a private `random.Random` instance so it never pollutes global RNG state
-    and always produces the same triplets regardless of training state.
-    """
-
-    def __init__(self, base: TripletImageFolder, n_samples: int, seed: int = 42) -> None:
-        rng = random.Random(seed)
-        self._base = base
-
-        anchor_indices = rng.sample(range(len(base)), min(n_samples, len(base)))
-
-        self._triplets: list[tuple[int, int, int]] = []
-        for anchor_idx in anchor_indices:
-            anchor_label = base._base.targets[anchor_idx]
-
-            pos_pool = base._class_to_indices[anchor_label]
-            pos_idx = anchor_idx
-            while pos_idx == anchor_idx and len(pos_pool) > 1:
-                pos_idx = rng.choice(pos_pool)
-
-            neg_label = anchor_label
-            while neg_label == anchor_label:
-                neg_label = rng.choice(list(base._class_to_indices.keys()))
-            neg_idx = rng.choice(base._class_to_indices[neg_label])
-
-            self._triplets.append((anchor_idx, pos_idx, neg_idx))
-
-    def __len__(self) -> int:
-        return len(self._triplets)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        anchor_idx, pos_idx, neg_idx = self._triplets[index]
-        base = self._base
-
-        anchor_img = base._load(anchor_idx)
-        pos_img    = base._load(pos_idx)
-        neg_img    = base._load(neg_idx)
-
-        if base.anchor_transform is not None:
-            anchor_img = base.anchor_transform(anchor_img)
-        if base.transform is not None:
-            pos_img = base.transform(pos_img)
-            neg_img = base.transform(neg_img)
-
-        return anchor_img, pos_img, neg_img
-
 
 class IndexAssignedTripletDataset(Dataset):
     """Triplet dataset driven by a pre-built JSON index.
@@ -156,6 +37,13 @@ class IndexAssignedTripletDataset(Dataset):
         query_transform: Optional separate transform for the query image; falls
             back to *transform* when not provided.
         loader: Callable that loads a PIL image from a path.
+        random_negative_prob: Probability of replacing the index-mined
+            negative with a random image of a *different* lynx, drawn from
+            the whole candidate pool (every lynx dir under the same split the
+            index's own positives/negatives come from) instead of just this
+            entry's top_m negatives. 0 (default) keeps the original
+            index-only behavior. Requires `root` to be set, since the
+            candidate pool is built by scanning the filesystem.
     """
 
     def __init__(
@@ -165,11 +53,13 @@ class IndexAssignedTripletDataset(Dataset):
         transform: transforms.Compose | None = None,
         query_transform: transforms.Compose | None = None,
         loader=None,
+        random_negative_prob: float = 0.0,
     ) -> None:
         self.root = Path(root) if root is not None else None
         self.transform = transform
         self.query_transform = query_transform or transform
         self._loader = loader or default_loader
+        self.random_negative_prob = random_negative_prob
 
         with open(index_path) as f:
             self._entries: list[dict] = json.load(f)
@@ -180,11 +70,46 @@ class IndexAssignedTripletDataset(Dataset):
             if not entry.get("negatives"):
                 raise ValueError(f"Entry for {entry['query_frame']} has no negatives.")
 
+        self._lynx_pool: dict[str, list[str]] = {}
+        self._lynx_ids: list[str] = []
+        if random_negative_prob > 0:
+            if self.root is None:
+                raise ValueError("random_negative_prob > 0 requires `root` to be set")
+            self._lynx_pool = self._scan_lynx_pool()
+            self._lynx_ids = list(self._lynx_pool)
+
+    def _scan_lynx_pool(self) -> dict[str, list[str]]:
+        """Every image under the split that positives/negatives are drawn
+        from (e.g. 'train/'), grouped by lynx id — the same split used by
+        every entry's own positives/negatives, whatever the query's split.
+        """
+        cand_split = Path(self._entries[0]["positives"][0]).parts[0]
+        cand_root = self.root / cand_split
+        pool: dict[str, list[str]] = defaultdict(list)
+        for lynx_dir in sorted(cand_root.iterdir()):
+            if not lynx_dir.is_dir():
+                continue
+            for img_path in lynx_dir.rglob("*.jpg"):
+                pool[lynx_dir.name].append(str(img_path.relative_to(self.root)))
+        return dict(pool)
+
+    def _lynx_id(self, rel_path: str) -> str:
+        return Path(rel_path).parts[1]
+
     def __len__(self) -> int:
         return len(self._entries)
 
     def _full_path(self, rel: str) -> Path:
         return self.root / rel if self.root is not None else Path(rel)
+
+    def _sample_negative(self, entry: dict) -> str:
+        if self.random_negative_prob > 0 and random.random() < self.random_negative_prob:
+            query_lynx = self._lynx_id(entry["query_frame"])
+            neg_lynx = query_lynx
+            while neg_lynx == query_lynx:
+                neg_lynx = random.choice(self._lynx_ids)
+            return random.choice(self._lynx_pool[neg_lynx])
+        return random.choice(entry["negatives"])
 
     def __getitem__(
         self, index: int
@@ -193,7 +118,7 @@ class IndexAssignedTripletDataset(Dataset):
 
         query_path = self._full_path(entry["query_frame"])
         pos_path   = self._full_path(random.choice(entry["positives"]))
-        neg_path   = self._full_path(random.choice(entry["negatives"]))
+        neg_path   = self._full_path(self._sample_negative(entry))
 
         query_img = self._loader(query_path)
         pos_img   = self._loader(pos_path)
@@ -273,76 +198,6 @@ class PseudoAccuracyDataset(Dataset):
             cand_imgs = [self.transform(img) for img in cand_imgs]
 
         return query_img, torch.stack(cand_imgs), index
-
-
-class LabeledImageFolder(ImageFolder):
-    """Plain ImageFolder that returns (image, label) pairs.
-
-    Suitable for online triplet/contrastive mining where the loss function
-    constructs pairs/triplets from a regular labeled batch.
-    """
-
-    def __init__(
-        self,
-        root: str | Path,
-        transform: transforms.Compose | None = None,
-    ) -> None:
-        super().__init__(root=str(root), transform=transform)
-
-
-class BalancedBatchSampler(Sampler):
-    """Yields batches with exactly `n_classes` classes and `n_samples` per class.
-
-    Commonly used with online triplet/contrastive loss to guarantee that every
-    batch contains enough positives to mine from.
-
-    Args:
-        labels: Sequence of integer class labels, one per dataset item.
-        n_classes: Number of distinct classes per batch.
-        n_samples: Number of samples per class per batch.
-    """
-
-    def __init__(
-        self,
-        labels: list[int],
-        n_classes: int,
-        n_samples: int,
-    ) -> None:
-        super().__init__()
-        self.n_classes = n_classes
-        self.n_samples = n_samples
-        self.batch_size = n_classes * n_samples
-
-        self._class_to_indices: dict[int, list[int]] = defaultdict(list)
-        for idx, label in enumerate(labels):
-            self._class_to_indices[label].append(idx)
-
-        self._classes = list(self._class_to_indices.keys())
-        if len(self._classes) < n_classes:
-            raise ValueError(
-                f"Dataset has only {len(self._classes)} classes, "
-                f"but n_classes={n_classes} was requested."
-            )
-
-        # Number of batches: how many times we can cycle through all classes
-        self._n_batches = len(labels) // self.batch_size
-
-    def __len__(self) -> int:
-        return self._n_batches
-
-    def __iter__(self):
-        for _ in range(self._n_batches):
-            chosen_classes = random.sample(self._classes, self.n_classes)
-            batch: list[int] = []
-            for cls in chosen_classes:
-                pool = self._class_to_indices[cls]
-                # Sample with replacement if the class has fewer than n_samples images
-                batch.extend(
-                    random.choices(pool, k=self.n_samples)
-                    if len(pool) < self.n_samples
-                    else random.sample(pool, self.n_samples)
-                )
-            yield batch
 
 
 def get_loader(

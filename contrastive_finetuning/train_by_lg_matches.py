@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import copy
-import math
+import contextlib
 import random
 import time
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from torch import nn
 from tqdm.auto import tqdm
 from torchvision import transforms
 
@@ -19,41 +17,34 @@ from contrastive_finetuning.loading import IndexAssignedTripletDataset, get_load
 from contrastive_finetuning.models import build_rdd, build_masked_lg
 from contrastive_finetuning.train_common import (
     _lg_scores, _unwrap, add_common_args, build_wandb_tags, eval_epoch, eval_pseudo_accuracy,
-    extract_train, resize_long_side, run_lg_matching_grad, seed_all,
+    extract_train, resize_long_side, resolve_trained_models, run_lg_matching_grad, seed_all,
 )
 
 """
-Fine-tunes LightGlue's own matching weights directly, instead of treating it as
-a fixed, external oracle for evaluating matches (as a descriptor-training setup
-would): RDD is fully frozen; only LightGlue is trained, via a margin loss on
-its OWN matching confidence (`scores`, the per-match probability LG assigns to
-the pairs it selects) rather than on raw descriptor dot products.
+Trains via a margin loss on LightGlue's OWN matching confidence (`scores`,
+the per-match probability LG assigns to the pairs it selects) rather than on
+raw descriptor dot products — i.e. treating LG's own matches as the training
+signal instead of a fixed, external oracle for evaluating matches (as a
+descriptor-training setup would).
 
-LightGlueMasked always `.detach()`s its descriptor *inputs* internally (see
-rdd_patch/lightglue_masked.py), so this loss can only ever reach LightGlue's
-own transformer/assignment weights — it cannot backprop into RDD, which is
-exactly what we want here since RDD is meant to stay untouched.
+`--trained_model` (lg / rdd / lg+rdd) decides which model(s) are unfrozen and
+receive gradient; the other stays frozen. LightGlueMasked detaches its
+descriptor *inputs* by default (see `detach_descriptors` in
+rdd_patch/lightglue_masked.py), which is what normally keeps this loss from
+backpropagating into RDD; when `--trained_model` includes 'rdd', LG is built
+with `detach_descriptors=False` so gradient can reach RDD too.
 
-Three independent, combinable anti-overfitting mechanisms, each off by default:
-  --augment    photometric-only data augmentation on the training images
-               (never on val — keypoint geometry is untouched, detection runs
-               after augmentation, so correspondences stay valid).
-  --lora / --lora_rank
-               freeze LightGlue's own pretrained weights and train only
-               low-rank adapters injected into its attention/assignment
-               Linear layers — drastically fewer trainable params than full
-               fine-tuning. The rotary positional encoding (posenc.Wr) is
-               deliberately left un-adapted.
-  --ema_decay  exponential moving average of LightGlue's weights, used for all
-               evaluation/checkpointing instead of the raw (noisier) live
-               weights — smooths over late-training variance/overfitting.
+--augment applies photometric-only data augmentation on the training images
+(never on val — keypoint geometry is untouched, detection runs after
+augmentation, so correspondences stay valid), off by default.
 """
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Fine-tune LightGlue's own matching weights; RDD stays frozen."
+        description="Train via a margin loss on LightGlue's own matching confidence; "
+                     "--trained_model picks which of LG/RDD are unfrozen."
     )
     add_common_args(p)
     p.add_argument("--lg_margin", type=float, default=0.5, help="Margin for the LightGlue match-confidence loss")
@@ -62,14 +53,16 @@ def parse_args() -> argparse.Namespace:
         help="Apply photometric-only augmentation (color jitter, light blur) to training images",
     )
     p.add_argument(
-        "--lora", action="store_true",
-        help="Freeze LightGlue's own weights and train only injected LoRA adapters (see --lora_rank)",
+        "--random_negative_prob", type=float, default=0.0,
+        help="Probability of replacing the index-mined training negative with a random "
+             "image of a different lynx drawn from the whole candidate pool, instead of "
+             "just the entry's top_m negatives. 0 (default) keeps negatives index-only.",
     )
-    p.add_argument("--lora_rank", type=int, default=8, help="LoRA adapter rank (only used with --lora)")
     p.add_argument(
-        "--ema_decay", type=float, default=0.0,
-        help="EMA decay for LightGlue's weights (0 disables); the EMA copy is used for all "
-             "eval/checkpointing instead of the raw live weights (typical 0.999)",
+        "--freeze_confidence_head", action="store_true",
+        help="Freeze LightGlue's log_assignment and token_confidence submodules (the "
+             "matchability/confidence heads) so only the attention/transformer backbone "
+             "trains.",
     )
     return p.parse_args()
 
@@ -137,8 +130,8 @@ def build_transforms(augment: bool) -> tuple[transforms.Compose, transforms.Comp
     Returns (train_transform, eval_transform). eval_transform is always plain
     ToTensor (val/eval must stay clean). When augment, train_transform adds
     photometric-only jitter — no crop/flip/rotate, since keypoints are detected
-    *after* this transform (frozen RDD), so geometric augmentation would just
-    shrink the true anchor/positive keypoint overlap rather than help.
+    *after* this transform, so geometric augmentation would just shrink the
+    true anchor/positive keypoint overlap rather than help.
     """
     eval_transform = transforms.ToTensor()
     if not augment:
@@ -151,85 +144,11 @@ def build_transforms(augment: bool) -> tuple[transforms.Compose, transforms.Comp
     return train_transform, eval_transform
 
 
-# ── LoRA ──────────────────────────────────────────────────────────────────────
-class LoRALinear(nn.Module):
-    """Wraps a frozen nn.Linear with a trainable low-rank adapter (Hu et al. 2021).
-
-    `lora_B` is zero-initialized so the wrapped layer starts out numerically
-    identical to the original — training begins from LightGlue's pretrained
-    behavior, not a perturbed one.
-    """
-
-    def __init__(self, base: nn.Linear, rank: int, alpha: float | None = None) -> None:
-        super().__init__()
-        self.base = base
-        for p in self.base.parameters():
-            p.requires_grad_(False)
-        self.rank = rank
-        self.scaling = (alpha if alpha is not None else rank) / rank
-        device, dtype = base.weight.device, base.weight.dtype
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features,  device=device, dtype=dtype))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, device=device, dtype=dtype))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        delta = (x.to(self.lora_A.dtype) @ self.lora_A.t() @ self.lora_B.t()) * self.scaling
-        return self.base(x) + delta.to(x.dtype)
-
-
-def _apply_lora_recursive(module: nn.Module, rank: int) -> int:
-    count = 0
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            setattr(module, name, LoRALinear(child, rank))
-            count += 1
-        else:
-            count += _apply_lora_recursive(child, rank)
-    return count
-
-
-def apply_lora(lg: nn.Module, rank: int) -> int:
-    """
-    Freezes LightGlue's own weights and injects LoRA adapters into the
-    attention/FFN/assignment Linear layers (self_attn, cross_attn,
-    log_assignment, token_confidence). Deliberately excludes
-    `posenc.Wr` (the rotary positional encoding basis) and `input_proj` when
-    it's the identity (true for the "rdd" feature config) — those aren't part
-    of the actual matching computation being adapted.
-
-    Returns the number of Linear layers wrapped.
-    """
-    targets = [lg.transformers, lg.log_assignment, lg.token_confidence]
-    if not isinstance(lg.input_proj, nn.Identity):
-        targets.append(lg.input_proj)
-    return sum(_apply_lora_recursive(root, rank) for root in targets)
-
-
-# ── EMA ───────────────────────────────────────────────────────────────────────
-def build_ema(model: nn.Module, device: torch.device) -> nn.Module:
-    """Deep-copy `model` into a frozen, eval-mode EMA shadow."""
-    ema = copy.deepcopy(_unwrap(model)).to(device)
-    ema.eval()
-    for p in ema.parameters():
-        p.requires_grad_(False)
-    return ema
-
-
-@torch.no_grad()
-def update_ema(ema: nn.Module, model: nn.Module, decay: float) -> None:
-    model = _unwrap(model)
-    for e_p, m_p in zip(ema.parameters(), model.parameters()):
-        e_p.mul_(decay).add_(m_p.detach(), alpha=1 - decay)
-    for e_b, m_b in zip(ema.buffers(), model.buffers()):
-        e_b.copy_(m_b)
-
-
 # ── training epoch ────────────────────────────────────────────────────────────
 def train_epoch_lg(
     accelerator: Accelerator,
     rdd: torch.nn.Module,
     lg: torch.nn.Module,
-    eval_lg: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     loader,
     mini_train_loader,
@@ -238,15 +157,10 @@ def train_epoch_lg(
     total_epochs: int,
     args: argparse.Namespace,
     global_step: int,
-    ema_lg: torch.nn.Module | None = None,
 ) -> tuple[float, int]:
-    """
-    `eval_lg` is what mini-evals run against (the EMA shadow when --ema_decay >
-    0, else `lg` itself); `lg` is always what receives gradient. `ema_lg` (same
-    object as `eval_lg` when EMA is on, else None) is updated after every step.
-    """
-    _unwrap(rdd).eval()
-    lg.train()
+    train_rdd, train_lg = resolve_trained_models(args.trained_model)
+    _unwrap(rdd).train(train_rdd)
+    lg.train(train_lg)
 
     epoch_loss     = 0.0
     epoch_skipped  = 0
@@ -268,8 +182,8 @@ def train_epoch_lg(
         negatives_r = resize_long_side(negatives, args.resize).to(device)
         H_r, W_r = anchors_r.shape[-2:]
 
-        # RDD is frozen — no_grad purely to skip building an unused graph.
-        with torch.no_grad():
+        # When RDD isn't being trained, no_grad purely skips building an unused graph.
+        with contextlib.nullcontext() if train_rdd else torch.no_grad():
             feats_a = extract_train(rdd, anchors_r)
             feats_p = extract_train(rdd, positives_r)
             feats_n = extract_train(rdd, negatives_r)
@@ -284,16 +198,14 @@ def train_epoch_lg(
         epoch_skipped += stats["n_skipped"]
         epoch_images  += len(feats_a)
 
+        trainable_params = [p for p in _unwrap(lg).parameters() if p.requires_grad]
+        if train_rdd:
+            trainable_params += [p for p in _unwrap(rdd).parameters() if p.requires_grad]
+
         optimizer.zero_grad()
         accelerator.backward(loss)
-        accelerator.clip_grad_norm_(
-            (p for p in _unwrap(lg).parameters() if p.requires_grad),
-            args.grad_clip,
-        )
+        accelerator.clip_grad_norm_(trainable_params, args.grad_clip)
         optimizer.step()
-
-        if ema_lg is not None:
-            update_ema(ema_lg, lg, args.ema_decay)
 
         loss_val    = loss.item()
         epoch_loss += loss_val
@@ -317,11 +229,11 @@ def train_epoch_lg(
 
         if (step + 1) % 100 == 0:
             t_mini_start = time.perf_counter()
-            mini_train_m = eval_epoch(accelerator, rdd, eval_lg, mini_train_loader, args, prefix="mini_train")
-            mini_val_m   = eval_epoch(accelerator, rdd, eval_lg, mini_val_loader,   args, prefix="mini_val")
+            mini_train_m = eval_epoch(accelerator, rdd, lg, mini_train_loader, args, prefix="mini_train")
+            mini_val_m   = eval_epoch(accelerator, rdd, lg, mini_val_loader,   args, prefix="mini_val")
             mini_eval_time += time.perf_counter() - t_mini_start
-            _unwrap(rdd).eval()
-            lg.train()
+            _unwrap(rdd).train(train_rdd)
+            lg.train(train_lg)
             if accelerator.is_main_process:
                 accelerator.log({**mini_train_m, **mini_val_m, "progress": progress}, step=global_step)
 
@@ -354,13 +266,17 @@ def run_training_lg(args: argparse.Namespace) -> None:
 
     # ── data ──
     train_transform, eval_transform = build_transforms(args.augment)
-    train_ds = IndexAssignedTripletDataset(args.train_index, root=args.data_root, transform=train_transform)
-    # Diagnostics/eval on the training split must stay on clean images, even
-    # when the actual training loader is augmented — otherwise train_eval/
-    # mini_train metrics would be noisier than val's and not comparable.
+    train_ds = IndexAssignedTripletDataset(
+        args.train_index, root=args.data_root, transform=train_transform,
+        random_negative_prob=args.random_negative_prob,
+    )
+    # Diagnostics/eval on the training split must stay on clean, index-only
+    # negatives, even when the actual training loader is augmented and/or
+    # mixes in random negatives — otherwise train_eval/mini_train metrics
+    # would be noisier than val's and not comparable across epochs.
     train_ds_eval = (
         IndexAssignedTripletDataset(args.train_index, root=args.data_root, transform=eval_transform)
-        if args.augment else train_ds
+        if (args.augment or args.random_negative_prob > 0) else train_ds
     )
     val_ds = IndexAssignedTripletDataset(args.val_index, root=args.data_root, transform=eval_transform)
 
@@ -391,33 +307,46 @@ def run_training_lg(args: argparse.Namespace) -> None:
     eval_val_subset   = val_ds
 
     # ── models ──
+    train_rdd, train_lg = resolve_trained_models(args.trained_model)
+
     rdd = build_rdd(args.rdd_weights, device, args.top_k)
-    lg  = build_masked_lg(device, weights=args.lg_weights)
+    # detach_descriptors=False lets gradient reach RDD through LG's forward
+    # pass (see rdd_patch/lightglue_masked.py); irrelevant when RDD is frozen.
+    lg  = build_masked_lg(device, weights=args.lg_weights, detach_descriptors=not train_rdd)
 
     for p in rdd.parameters():
-        p.requires_grad_(False)
+        p.requires_grad_(train_rdd)
 
-    if args.lora:
-        n_wrapped = apply_lora(_unwrap(lg), args.lora_rank)
-        accelerator.print(f"[lora] wrapped {n_wrapped} Linear layers with rank-{args.lora_rank} adapters")
+    if args.freeze_confidence_head:
+        lg_unwrapped = _unwrap(lg)
+        n_frozen = 0
+        for submodule in (lg_unwrapped.log_assignment, lg_unwrapped.token_confidence):
+            for p in submodule.parameters():
+                p.requires_grad_(False)
+                n_frozen += 1
+        accelerator.print(f"[freeze_confidence_head] froze {n_frozen} parameters in log_assignment + token_confidence")
 
-    # EMA shadow of LG's weights, built from its current (possibly LoRA-wrapped)
-    # state, before accelerator.prepare wraps lg for DDP. Used for all eval below.
-    ema_lg = build_ema(lg, device) if args.ema_decay > 0 else None
+    if not train_lg:
+        for p in _unwrap(lg).parameters():
+            p.requires_grad_(False)
 
-    optimizer = torch.optim.Adam(
-        [p for p in lg.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay,
-    )
+    trainable_params = [p for p in lg.parameters() if p.requires_grad]
+    if train_rdd:
+        trainable_params += [p for p in rdd.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # rdd is fully frozen (requires_grad=False everywhere) — DDP-wrapping a
-    # module with no trainable parameters is unnecessary and can error out
-    # under some Accelerate/PyTorch versions, so it's left unprepared.
-    lg, optimizer, train_loader, mini_train_loader, mini_val_loader = accelerator.prepare(
-        lg, optimizer, train_loader, mini_train_loader, mini_val_loader
-    )
-    eval_lg = ema_lg if ema_lg is not None else lg
+    # DDP-wrapping a module with no trainable parameters is unnecessary and can
+    # error out under some Accelerate/PyTorch versions, so a frozen rdd is left
+    # unprepared; it's only included here when --trained_model unfreezes it.
+    if train_rdd:
+        rdd, lg, optimizer, train_loader, mini_train_loader, mini_val_loader = accelerator.prepare(
+            rdd, lg, optimizer, train_loader, mini_train_loader, mini_val_loader
+        )
+    else:
+        lg, optimizer, train_loader, mini_train_loader, mini_val_loader = accelerator.prepare(
+            lg, optimizer, train_loader, mini_train_loader, mini_val_loader
+        )
 
     if args.project:
         accelerator.init_trackers(
@@ -428,30 +357,29 @@ def run_training_lg(args: argparse.Namespace) -> None:
 
     # ── baseline eval (before any training) ──
     global_step = 0
-    baseline_train = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_train_subset, args, prefix="train_eval")
-    baseline_val   = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_val_subset,   args, prefix="val")
-    _unwrap(rdd).eval()
-    lg.train()
+    baseline_train = eval_pseudo_accuracy(accelerator, rdd, lg, eval_train_subset, args, prefix="train_eval")
+    baseline_val   = eval_pseudo_accuracy(accelerator, rdd, lg, eval_val_subset,   args, prefix="val")
+    _unwrap(rdd).train(train_rdd)
+    lg.train(train_lg)
     if accelerator.is_main_process:
         accelerator.log({**baseline_train, **baseline_val, "epoch": -1}, step=global_step)
 
     # ── loop ──
     for epoch in range(args.epochs):
         epoch_loss, global_step = train_epoch_lg(
-            accelerator, rdd, lg, eval_lg, optimizer, train_loader,
+            accelerator, rdd, lg, optimizer, train_loader,
             mini_train_loader, mini_val_loader,
             epoch, args.epochs, args, global_step,
-            ema_lg=ema_lg,
         )
 
         t_eval_start = time.perf_counter()
         do_eval = epoch % args.eval_every_epochs == args.eval_every_epochs - 1
         if do_eval:
-            train_eval_metrics = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_train_subset, args, prefix="train_eval")
-            val_metrics        = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_val_subset,   args, prefix="val")
+            train_eval_metrics = eval_pseudo_accuracy(accelerator, rdd, lg, eval_train_subset, args, prefix="train_eval")
+            val_metrics        = eval_pseudo_accuracy(accelerator, rdd, lg, eval_val_subset,   args, prefix="val")
         epoch_eval_time = time.perf_counter() - t_eval_start
-        _unwrap(rdd).eval()
-        lg.train()
+        _unwrap(rdd).train(train_rdd)
+        lg.train(train_lg)
 
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
@@ -470,8 +398,6 @@ def run_training_lg(args: argparse.Namespace) -> None:
             accelerator.log(metrics, step=global_step)
             ckpt_dir = args.output_dir / f"epoch_{epoch:02d}"
             accelerator.save_state(str(ckpt_dir))
-            if ema_lg is not None:
-                torch.save(ema_lg.state_dict(), ckpt_dir / "ema_lg.pt")
 
     if args.project:
         accelerator.end_training()
