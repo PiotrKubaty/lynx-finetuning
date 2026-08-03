@@ -6,6 +6,7 @@ from pathlib import Path
 from accelerate import Accelerator
 from torchvision import transforms
 
+from contrastive_finetuning.keypoint_cache import open_cache_for_run
 from contrastive_finetuning.loading import IndexAssignedTripletDataset
 from contrastive_finetuning.models import build_rdd, build_masked_lg
 from contrastive_finetuning.train_common import (
@@ -35,6 +36,14 @@ def parse_args() -> argparse.Namespace:
              "forward call (RDD's deformable attention scales steeply with "
              "images-per-call, so the candidate pool is chunked to this size)",
     )
+    parser.add_argument(
+        "--keypoint_cache", type=Path, default=None,
+        help="Prebuilt RDD keypoint cache to read detections from instead of "
+             "running RDD (see contrastive_finetuning.build_keypoint_cache). RDD is "
+             "frozen on this path by definition, so the cache is always valid here "
+             "as long as it was built with the same --rdd_weights/--resize/--top_k, "
+             "which it verifies on open.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     # eval_pseudo_accuracy/build_pseudo_accuracy_loader read these two
@@ -51,7 +60,12 @@ def main() -> None:
     device = accelerator.device
 
     transform = transforms.ToTensor()
-    ds = IndexAssignedTripletDataset(args.index, root=args.data_root, transform=transform)
+    feature_cache = None
+    if args.keypoint_cache is not None:
+        feature_cache = open_cache_for_run(
+            args.keypoint_cache, args.rdd_weights, args.resize, args.top_k)
+    ds = IndexAssignedTripletDataset(
+        args.index, root=args.data_root, transform=transform, feature_cache=feature_cache)
     loader = build_pseudo_accuracy_loader(accelerator, ds, args)
 
     rdd = build_rdd(args.rdd_weights, device, args.top_k)
