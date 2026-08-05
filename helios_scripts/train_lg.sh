@@ -12,7 +12,8 @@
 
 source helios_scripts/_activate.sh
 
-seed=$1
+seed=${1-0}
+echo Seed: $seed
 
 batch_size=32
 lg_margin=0.5
