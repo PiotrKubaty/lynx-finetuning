@@ -194,7 +194,7 @@ old_dataset
 *.tiff
 *.ico
 *.out
-*.sh
+#*.sh
 *.txt
 *.log
 *.csv
