@@ -420,6 +420,13 @@ class PseudoAccuracyDataset(Dataset):
             )
         self.n_pos = next(iter(n_pos)) if n_pos else 0
         self.n_neg = next(iter(n_neg)) if n_neg else 0
+        # (n_entries, n_pos + n_neg) bool mask of the mode-B candidate pool
+        # behind video_accuracy_hybrid: filled in by train_common's
+        # eval_pseudo_accuracy on its first pass over this dataset, then reused
+        # unchanged by every later pass. Columns index `positives + negatives`,
+        # the order __getitem__ stacks candidates in. Nothing is written back
+        # to the index file; the pool lives only as long as this object does.
+        self.mode_b_mask: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return len(self.entries)

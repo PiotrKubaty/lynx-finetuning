@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,14 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--wandb_tags", type=str, default="",
         help="Comma-separated wandb tags for this run",
+    )
+    p.add_argument(
+        "--mode_b_top_k", type=int, default=0,
+        help="K: candidates kept per query frame by the ground-truth-blind preselection "
+             "behind val/video_accuracy_hybrid (see eval_pseudo_accuracy). 0 means the "
+             "index's own top_k, i.e. the number of positives per entry, which mirrors "
+             "the index's negative pool; pass 2*top_k to match the index's total "
+             "per-frame budget instead.",
     )
     p.add_argument(
         "--trained_model", type=str, default="lg", choices=["lg", "rdd", "lg+rdd"],
@@ -304,6 +313,44 @@ def _lg_scores(pred: dict, q_data: dict, g_data: dict, device: torch.device) -> 
     return sums / torch.minimum(n_q, n_g)
 
 
+def _score_candidate_pool(
+    rdd: torch.nn.Module,
+    lg: torch.nn.Module,
+    query_batch: torch.Tensor,
+    cand_batch: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.Tensor:
+    """Score every query in a PseudoAccuracyDataset batch against its own candidates.
+
+    `query_batch` is (B, C, H, W), `cand_batch` is (B, n_cand, C, H, W) as they
+    come off the loader; returns a (B, n_cand) score matrix.
+
+    Extracted so eval_pseudo_accuracy and annotate_mode_b_pool.py drive the
+    exact same forward pass — the mode-B annotation is only a faithful
+    preselection of the pool eval_pseudo_accuracy then scores if both read the
+    images through the same resize/extract/normalise path.
+    """
+    B, n_cand, C, H, W = cand_batch.shape
+
+    query_r = resize_long_side(query_batch, args.resize)
+    H_q, W_q = query_r.shape[-2:]
+    feats_q = _extract_chunked(_unwrap(rdd), query_r, args.batch_size)
+
+    cand_r = resize_long_side(cand_batch.view(B * n_cand, C, H, W), args.resize)
+    H_c, W_c = cand_r.shape[-2:]
+    feats_c = _extract_chunked(_unwrap(rdd), cand_r, args.batch_size)
+
+    # Each query's features are matched against its own n_cand candidates
+    # positionally, so repeat them to line up as one flat (B * n_cand)
+    # -sized batch for LG.
+    feats_q_rep = [f for f in feats_q for _ in range(n_cand)]
+    data_q = batch_features(feats_q_rep, H_q, W_q)
+    data_c = batch_features(feats_c,     H_c, W_c)
+    pred = lg({"image0": data_q, "image1": data_c})
+    return _lg_scores(pred, data_q, data_c, device).view(B, n_cand)
+
+
 def build_pseudo_accuracy_loader(
     accelerator: Accelerator,
     dataset_subset,
@@ -344,6 +391,121 @@ def build_pseudo_accuracy_loader(
     return accelerator.prepare(loader)
 
 
+# ── mode-B candidate pool ─────────────────────────────────────────────────────
+def diverse_topk_cols(scores: list[float], videos: list[str], k: int) -> list[int]:
+    """Index port of lynx_find_strong_matches_in_parallel.select_diverse_topk.
+
+    Picks up to k candidates by descending score while spreading picks across
+    videos: candidates are grouped by video and sorted within each group, then
+    taken round-robin over videos (best video first, by its top score), one
+    frame per round. Same grouping, same (stable) sort order and same
+    round-robin as the mining script — it just carries positions in the
+    candidate list instead of dicts.
+    """
+    if k <= 0 or not scores:
+        return []
+
+    by_video: dict[str, list[int]] = defaultdict(list)
+    for c in range(len(scores)):
+        by_video[videos[c]].append(c)
+    for v in by_video:
+        by_video[v].sort(key=lambda c: scores[c], reverse=True)
+    video_order = sorted(by_video.keys(), key=lambda v: scores[by_video[v][0]], reverse=True)
+
+    selected: list[int] = []
+    rank = 0
+    while len(selected) < k:
+        added_any = False
+        for v in video_order:
+            if rank < len(by_video[v]):
+                selected.append(by_video[v][rank])
+                added_any = True
+                if len(selected) == k:
+                    break
+        if not added_any:
+            break
+        rank += 1
+    return selected
+
+
+def mode_b_pool_rows(
+    scores: torch.Tensor, entries: list[dict], idxs: list[int], k: int
+) -> torch.Tensor:
+    """Mode-B pool of one batch: (B, n_cand) bool, row r for entry `idxs[r]`.
+
+    `scores[r]` are entry idxs[r]'s candidate scores in `positives +
+    negatives` order; the pool is one `select_diverse_topk` over all of them
+    pooled together, i.e. with no slots reserved for the correct lynx_id.
+    """
+    rows = scores.cpu().tolist()  # one sync for the whole batch
+    pool = torch.zeros(len(idxs), scores.shape[1], dtype=torch.bool)
+    for r, i in enumerate(idxs):
+        entry = entries[i]
+        videos = [_video_id(p) for p in entry["positives"] + entry["negatives"]]
+        pool[r, diverse_topk_cols(rows[r], videos, k)] = True
+    return pool
+
+
+def _log_mode_b_pool(accelerator: Accelerator, prefix: str, ds, mask: torch.Tensor) -> None:
+    """One-off summary of the pool that was just frozen.
+
+    `videos_with_positive` is the ceiling on video_accuracy_hybrid for this
+    index and this preselect checkpoint: a video whose true lynx_id survives
+    preselection on no query frame at all cannot be predicted correctly by any
+    stage-2 checkpoint, however good.
+    """
+    kept_pos = mask[:, :ds.n_pos].any(dim=1)
+    videos_with_positive = {
+        _video_id(e["query_frame"]) for e, keeps in zip(ds.entries, kept_pos.tolist()) if keeps
+    }
+    videos = {_video_id(e["query_frame"]) for e in ds.entries}
+    n = max(len(ds.entries), 1)
+    accelerator.print(
+        f"[{prefix}/hybrid] froze mode-B pool: {int(mask.sum())} candidates over "
+        f"{len(ds.entries)} query frames "
+        f"({int(mask[:, :ds.n_pos].sum()) / n:.2f} of the true lynx_id per frame); "
+        f"true lynx_id survives on {int(kept_pos.sum())}/{len(ds.entries)} query frames "
+        f"and in {len(videos_with_positive)}/{len(videos)} videos "
+        f"({len(videos_with_positive) / max(len(videos), 1):.1%} — the ceiling on "
+        f"{prefix}/video_accuracy_hybrid)"
+    )
+
+
+def _update_video_best(
+    store: dict[str, dict], video_id: str, true_lynx: str,
+    score: float, query_frame: str, cand_path: str,
+) -> None:
+    """Keep, per query video, the single highest-scoring (query frame, candidate) pair."""
+    rec = store.setdefault(video_id, {
+        "true_lynx": true_lynx, "best_score": -float("inf"), "best_lynx": None,
+        "best_query_frame": None, "best_cand_path": None,
+    })
+    if score > rec["best_score"]:
+        rec["best_score"] = score
+        rec["best_lynx"] = _lynx_id(cand_path)
+        rec["best_query_frame"] = query_frame
+        rec["best_cand_path"] = cand_path
+
+
+def _video_accuracy(store: dict[str, dict]) -> float:
+    correct = [1.0 if rec["best_lynx"] == rec["true_lynx"] else 0.0 for rec in store.values()]
+    return sum(correct) / max(len(correct), 1)
+
+
+def _print_video_mismatches(accelerator: Accelerator, prefix: str, pool: str, store: dict[str, dict]) -> None:
+    n_wrong = 0
+    for video_id, rec in sorted(store.items()):
+        if rec["best_lynx"] == rec["true_lynx"]:
+            continue
+        n_wrong += 1
+        accelerator.print(
+            f"[{prefix}/{pool}] MISMATCH video={video_id} true_lynx={rec['true_lynx']} "
+            f"predicted_lynx={rec['best_lynx']} score={rec['best_score']:.4f} "
+            f"query_frame={rec['best_query_frame']} matched_candidate={rec['best_cand_path']}"
+        )
+    accelerator.print(f"[{prefix}/{pool}] {n_wrong}/{len(store)} videos misclassified")
+
+
 @torch.no_grad()
 def eval_pseudo_accuracy(
     accelerator: Accelerator,
@@ -360,80 +522,127 @@ def eval_pseudo_accuracy(
     matches wins; the prediction is correct when that winner is a positive.
 
     Also returns mean match counts over all pos/neg pairs as a byproduct, and
-    a video-level accuracy: paths look like
+    two video-level accuracies. Paths look like
     ``{split}/{lynx_id}/{location}/{video_id}/{frame}.jpg``, so all query
     frames sharing a parent directory belong to the same video/individual.
     For each video, the query frame with the single highest-scoring candidate
-    (over its whole pos+neg pool, not just positives) picks that candidate's
-    lynx_id as the video's prediction; correct when it matches the video's
-    own lynx_id.
+    picks that candidate's lynx_id as the video's prediction; correct when it
+    matches the video's own lynx_id. The two metrics differ only in which
+    candidates that maximum runs over:
+
+    ``video_accuracy_index``
+        the whole pool the index lists for the query frame. The index reserves
+        top_k slots for the correct lynx_id and makes every *other* identity
+        share the other top_k, so the correct answer is guaranteed to be on the
+        ballot — this number is optimistic by construction and is only
+        comparable across checkpoints scored on the same index.
+
+    ``video_accuracy_hybrid``
+        only the candidates that survive the ground-truth-blind preselection
+        ``lynx_query_two_stage_in_parallel.py`` calls mode B: one diverse top-k
+        (`--mode_b_top_k`) over all identities pooled together, with no slots
+        reserved for the correct one. The correct lynx_id has to earn its place
+        like any other, so a video is only counted correct when its identity
+        both survives preselection and then wins on score.
+
+        That pool is computed here, on the fly, from the scores this function
+        already needs — nothing is read from or written to the index file. It
+        is computed **once**, on the first pass over a given dataset, and then
+        frozen on ``PseudoAccuracyDataset.mode_b_mask`` and reused verbatim by
+        every later pass, so the pool stays tied to the checkpoint that was
+        loaded at that moment. In training that first pass is the baseline
+        evaluation, before any optimizer step, i.e. exactly the pretrained
+        checkpoint mode B's stage 1 is supposed to use; the pool then does not
+        drift with the model being judged. (A standalone run such as
+        eval_video_accuracy.py has only one pass, so there preselection and
+        scoring are the same checkpoint by construction.)
+
+        Reconstructing mode B from the index's own candidates is exact:
+        `select_diverse_topk` picks round-robin over videos, so with a budget
+        far below the number of gallery videos it only ever takes each chosen
+        video's best frame, and a video in the global top-k is necessarily in
+        the top-k of its own class (positives or negatives) — its best frame is
+        therefore already in the entry. The mining script's top_m is likewise
+        already applied to the entries, under the same ranking key mode B uses.
 
     `loader` comes from build_pseudo_accuracy_loader — a prepared DataLoader
     over a PseudoAccuracyDataset, so each process only scores its own shard of
     the queries and every query's full candidate pool goes through a single
     RDD+LG forward pass instead of being scored candidate by candidate. Every
     batch's results are gathered across processes (see gather_for_metrics
-    below), so all ranks return identical, whole-split metrics.
+    below), so all ranks return identical, whole-split metrics — and, on the
+    first pass, identical mode-B pools.
 
     If `verbose`, prints one line per misclassified video (wrong predicted
     lynx_id) with the winning query frame, its score, and the matched
-    candidate frame — see contrastive_finetuning/eval_video_accuracy.py.
+    candidate frame, once per pool — see
+    contrastive_finetuning/eval_video_accuracy.py.
     """
     device = accelerator.device
     _unwrap(rdd).eval()
 
     ds = loader.dataset
     entries = ds.entries
+    # First pass over this dataset: derive the mode-B pool from the scores
+    # below and freeze it. Every rank takes this branch together (they all hold
+    # a dataset in the same state), which is what keeps the gather below
+    # symmetric.
+    freezing_pool = ds.mode_b_mask is None
+    mode_b_top_k = getattr(args, "mode_b_top_k", 0) or ds.n_pos
+    frozen_mask = (
+        torch.zeros(len(entries), ds.n_pos + ds.n_neg, dtype=torch.bool) if freezing_pool else None
+    )
 
     accuracies: list[float] = []
     best_pos_scores: list[float] = []
     best_neg_scores: list[float] = []
-    # video_id -> {"true_lynx": str, "best_score": float, "best_lynx": str}
-    videos: dict[str, dict] = {}
+    # video_id -> {"true_lynx": str, "best_score": float, "best_lynx": str, ...}
+    videos: dict[str, dict] = {}         # over the index's own pool
+    videos_hybrid: dict[str, dict] = {}  # over the mode-B preselected pool
 
     for query_batch, cand_batch, idx_batch in tqdm(
         loader, desc=f"{prefix}", leave=False, disable=not accelerator.is_main_process
     ):
         query_batch = query_batch.to(device)
         cand_batch  = cand_batch.to(device)
-        B, n_cand, C, H, W = cand_batch.shape
 
-        query_r = resize_long_side(query_batch, args.resize)
-        H_q, W_q = query_r.shape[-2:]
-        feats_q = _extract_chunked(_unwrap(rdd), query_r, args.batch_size)
-
-        cand_r = resize_long_side(cand_batch.view(B * n_cand, C, H, W), args.resize)
-        H_c, W_c = cand_r.shape[-2:]
-        feats_c = _extract_chunked(_unwrap(rdd), cand_r, args.batch_size)
-
-        # Each query's features are matched against its own n_cand candidates
-        # positionally, so repeat them to line up as one flat (B * n_cand)
-        # -sized batch for LG.
-        feats_q_rep = [f for f in feats_q for _ in range(n_cand)]
-        data_q = batch_features(feats_q_rep, H_q, W_q)
-        data_c = batch_features(feats_c,     H_c, W_c)
-        pred = lg({"image0": data_q, "image1": data_c})
-        scores = _lg_scores(pred, data_q, data_c, device).view(B, n_cand)
+        scores = _score_candidate_pool(rdd, lg, query_batch, cand_batch, args, device)
 
         score_pos, _ = scores[:, :ds.n_pos].max(dim=1)
         score_neg, _ = scores[:, ds.n_pos:].max(dim=1)
         score_best, idx_best = scores.max(dim=1)
+
+        # idx_batch is still this rank's own shard here (the gather below is
+        # what turns it into the all-ranks version); .cpu() because the prepared
+        # loader may already have moved it to the device, while the pool lives
+        # on CPU with the dataset.
+        shard_idxs = idx_batch.cpu()
+        if freezing_pool:
+            pool = mode_b_pool_rows(scores, entries, shard_idxs.tolist(), mode_b_top_k)
+        else:
+            pool = ds.mode_b_mask[shard_idxs]
+        score_hybrid, idx_hybrid = scores.masked_fill(~pool.to(device), -float("inf")).max(dim=1)
 
         # Collect this batch's results from every process before touching
         # Python: the loader is sharded, so a rank only ever sees a slice of
         # the queries, and the frame/video aggregation below needs the whole
         # split. gather_for_metrics (rather than plain gather) drops the
         # duplicate samples Accelerate pads the last batches with to keep
-        # shard sizes equal.
-        score_pos, score_neg, score_best, idx_best, idx_batch = accelerator.gather_for_metrics(
-            (score_pos, score_neg, score_best, idx_best, idx_batch.to(device))
+        # shard sizes equal. The pool rides along on the first pass so that
+        # every rank ends up freezing the same whole-split mask.
+        (score_pos, score_neg, score_best, idx_best,
+         score_hybrid, idx_hybrid, pool, idx_batch) = accelerator.gather_for_metrics(
+            (score_pos, score_neg, score_best, idx_best, score_hybrid, idx_hybrid,
+             pool.to(device=device, dtype=torch.uint8), idx_batch.to(device))
         )
+        if freezing_pool:
+            frozen_mask[idx_batch.cpu()] = pool.cpu().bool()
 
         # One sync per batch (instead of one per query, let alone per
         # candidate) to pull the whole batch's results back to Python.
-        for sp, sn, sb, ib, idx in zip(
-            score_pos.tolist(), score_neg.tolist(), score_best.tolist(),
-            idx_best.tolist(), idx_batch.tolist(),
+        for sp, sn, sb, ib, shy, ihy, idx in zip(
+            score_pos.tolist(), score_neg.tolist(), score_best.tolist(), idx_best.tolist(),
+            score_hybrid.tolist(), idx_hybrid.tolist(), idx_batch.tolist(),
         ):
             if sp > sn:
                 accuracies.append(1.0)
@@ -448,37 +657,34 @@ def eval_pseudo_accuracy(
             video_id  = _video_id(entry["query_frame"])
             true_lynx = _lynx_id(entry["query_frame"])
             cand_paths = entry["positives"] + entry["negatives"]
-            best_lynx = _lynx_id(cand_paths[ib])
 
-            rec = videos.setdefault(video_id, {
-                "true_lynx": true_lynx, "best_score": -float("inf"), "best_lynx": None,
-                "best_query_frame": None, "best_cand_path": None,
-            })
-            if sb > rec["best_score"]:
-                rec["best_score"] = sb
-                rec["best_lynx"] = best_lynx
-                rec["best_query_frame"] = entry["query_frame"]
-                rec["best_cand_path"] = cand_paths[ib]
+            _update_video_best(videos, video_id, true_lynx, sb, entry["query_frame"], cand_paths[ib])
+            _update_video_best(
+                videos_hybrid, video_id, true_lynx, shy, entry["query_frame"], cand_paths[ihy])
+
+    if freezing_pool:
+        # diverse_topk_cols always returns at least one candidate, so an
+        # all-False row means the entry was never scored — which would make the
+        # frozen pool disagree with the metric just computed from it.
+        unfilled = int((~frozen_mask.any(dim=1)).sum())
+        if unfilled:
+            raise RuntimeError(
+                f"mode-B pool: {unfilled}/{len(entries)} query frames were never scored; "
+                "refusing to freeze a partial pool"
+            )
+        ds.mode_b_mask = frozen_mask
+        _log_mode_b_pool(accelerator, prefix, ds, frozen_mask)
 
     n = len(entries)
-    video_correct = [1.0 if rec["best_lynx"] == rec["true_lynx"] else 0.0 for rec in videos.values()]
 
     if verbose:
-        n_wrong = 0
-        for video_id, rec in sorted(videos.items()):
-            if rec["best_lynx"] == rec["true_lynx"]:
-                continue
-            n_wrong += 1
-            accelerator.print(
-                f"[{prefix}] MISMATCH video={video_id} true_lynx={rec['true_lynx']} "
-                f"predicted_lynx={rec['best_lynx']} score={rec['best_score']:.4f} "
-                f"query_frame={rec['best_query_frame']} matched_candidate={rec['best_cand_path']}"
-            )
-        accelerator.print(f"[{prefix}] {n_wrong}/{len(videos)} videos misclassified")
+        _print_video_mismatches(accelerator, prefix, "index", videos)
+        _print_video_mismatches(accelerator, prefix, "hybrid", videos_hybrid)
 
     return {
-        f"{prefix}/frame_accuracy": sum(accuracies)    / max(n, 1),
-        f"{prefix}/mean_score_pos":  sum(best_pos_scores) / max(n, 1),
-        f"{prefix}/mean_score_neg":  sum(best_neg_scores) / max(n, 1),
-        f"{prefix}/video_accuracy":  sum(video_correct) / max(len(video_correct), 1),
+        f"{prefix}/frame_accuracy":        sum(accuracies)      / max(n, 1),
+        f"{prefix}/mean_score_pos":        sum(best_pos_scores) / max(n, 1),
+        f"{prefix}/mean_score_neg":        sum(best_neg_scores) / max(n, 1),
+        f"{prefix}/video_accuracy_index":  _video_accuracy(videos),
+        f"{prefix}/video_accuracy_hybrid": _video_accuracy(videos_hybrid),
     }

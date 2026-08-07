@@ -16,7 +16,10 @@ from contrastive_finetuning.train_common import (
 Evaluates frame- and video-level pseudo-accuracy on a single checkpoint —
 no training. For every misclassified video, prints the query frame that
 produced the winning score, the score itself, and the (wrong) candidate frame
-that won instead of the correct lynx.
+that won instead of the correct lynx, once for the index's own candidate pool
+and once for the ground-truth-blind mode-B pool (see eval_pseudo_accuracy).
+With a single pass there is no earlier checkpoint around to preselect with, so
+here mode B's preselection and its scoring are the same checkpoint.
 """
 
 
@@ -34,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         help="Queries per DataLoader batch, and the max number of images per RDD "
              "forward call (RDD's deformable attention scales steeply with "
              "images-per-call, so the candidate pool is chunked to this size)",
+    )
+    parser.add_argument(
+        "--mode_b_top_k", type=int, default=0,
+        help="K: candidates kept per query frame by the ground-truth-blind preselection "
+             "behind video_accuracy_hybrid (see eval_pseudo_accuracy). 0 means the index's "
+             "own top_k, i.e. the number of positives per entry.",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
