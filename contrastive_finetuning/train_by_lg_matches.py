@@ -18,11 +18,12 @@ from torchvision import transforms
 
 from torch.utils.data import Subset
 
+from contrastive_finetuning.keypoint_cache import open_cache_for_run
 from contrastive_finetuning.loading import IndexAssignedTripletDataset, get_loader
 from contrastive_finetuning.models import build_rdd, build_masked_lg
 from contrastive_finetuning.train_common import (
     _lg_scores, _unwrap, add_common_args, batch_features, build_pseudo_accuracy_loader,
-    build_wandb_tags, eval_epoch, eval_pseudo_accuracy, extract_train, resize_long_side,
+    build_wandb_tags, eval_epoch, eval_pseudo_accuracy, features_from_batch,
     resolve_trained_models, run_lg_matching_grad, seed_all,
 )
 
@@ -169,6 +170,18 @@ def parse_args() -> argparse.Namespace:
         p.error("--negative_mining requires --random_negative_prob > 0")
     if args.weak_queries and not (0.0 < args.weak_queries_prob <= 1.0):
         p.error("--weak_queries requires --weak_queries_prob in (0, 1]")
+    if args.keypoint_cache is not None:
+        # The cache holds one fixed feature set per frame, so anything that
+        # would make RDD produce something else for that frame invalidates it.
+        if resolve_trained_models(args.trained_model)[0]:
+            p.error(
+                "--keypoint_cache requires --trained_model lg: with RDD unfrozen its "
+                "features change every step, so cached ones would be stale after the "
+                "first optimizer step"
+            )
+        if args.augment:
+            p.error("--keypoint_cache is incompatible with --augment (the cache was built "
+                    "from un-augmented frames, and no image is decoded to augment)")
     return args
 
 
@@ -359,12 +372,8 @@ def measure_negative_gap(
         for step, (anchors, positives, negatives, neg_meta) in enumerate(loader):
             if step >= n_batches:
                 break
-            anchors_r   = resize_long_side(anchors,   args.resize).to(device)
-            negatives_r = resize_long_side(negatives, args.resize).to(device)
-            H_r, W_r = anchors_r.shape[-2:]
-
-            feats_a = extract_train(rdd, anchors_r)
-            feats_n = extract_train(rdd, negatives_r)
+            feats_a, H_r, W_r = features_from_batch(anchors,   rdd, args.resize, device)
+            feats_n, _,   _   = features_from_batch(negatives, rdd, args.resize, device)
             data_a = batch_features(feats_a, H_r, W_r)
             data_n = batch_features(feats_n, H_r, W_r)
             pred_neg = lg({"image0": data_a, "image1": data_n})
@@ -541,16 +550,15 @@ def train_epoch_lg(
     )
     for step, (anchors, positives, negatives, neg_meta) in pbar:
         device = accelerator.device
-        anchors_r   = resize_long_side(anchors,   args.resize).to(device)
-        positives_r = resize_long_side(positives, args.resize).to(device)
-        negatives_r = resize_long_side(negatives, args.resize).to(device)
-        H_r, W_r = anchors_r.shape[-2:]
 
-        # When RDD isn't being trained, no_grad purely skips building an unused graph.
+        # When RDD isn't being trained, no_grad purely skips building an unused
+        # graph. With --keypoint_cache there is no forward to skip at all:
+        # features_from_batch returns the precomputed features for the frames
+        # the loader drew, and RDD is never called.
         with contextlib.nullcontext() if train_rdd else torch.no_grad():
-            feats_a = extract_train(rdd, anchors_r)
-            feats_p = extract_train(rdd, positives_r)
-            feats_n = extract_train(rdd, negatives_r)
+            feats_a, H_r, W_r = features_from_batch(anchors,   rdd, args.resize, device)
+            feats_p, _,   _   = features_from_batch(positives, rdd, args.resize, device)
+            feats_n, _,   _   = features_from_batch(negatives, rdd, args.resize, device)
 
         pred_pos, pred_neg, data_a, data_p, data_n = run_lg_matching_grad(lg, feats_a, feats_p, feats_n, H_r, W_r)
 
@@ -743,10 +751,23 @@ def run_training_lg(args: argparse.Namespace) -> None:
     weak_active    = args.weak_queries
     dataset_mutates = moving_active or mining_active  # see persistent_workers note below
 
+    # ── keypoint cache ──
+    # Opened before the datasets so a stale/mismatched cache fails here, on the
+    # spec check, rather than mid-epoch on the first missing frame.
+    feature_cache = None
+    if args.keypoint_cache is not None:
+        feature_cache = open_cache_for_run(
+            args.keypoint_cache, args.rdd_weights, args.resize, args.top_k)
+        accelerator.print(
+            f"keypoint cache: {args.keypoint_cache} "
+            f"({feature_cache.manifest.get('n_frames_enumerated', '?')} frames, "
+            f"built {feature_cache.manifest.get('built_at', '?')}) — RDD detection disabled")
+
     # ── data ──
     train_transform, eval_transform = build_transforms(args.augment)
     train_ds = IndexAssignedTripletDataset(
         args.train_index, root=args.data_root, transform=train_transform,
+        feature_cache=feature_cache,
         random_negative_prob=args.random_negative_prob,
         negative_mining=mining_active,
         negative_mining_temperature=args.negative_mining_temperature,
@@ -764,10 +785,12 @@ def run_training_lg(args: argparse.Namespace) -> None:
     # train_eval/mini_train metrics would be noisier than val's and not
     # comparable across epochs.
     train_ds_eval = (
-        IndexAssignedTripletDataset(args.train_index, root=args.data_root, transform=eval_transform)
+        IndexAssignedTripletDataset(args.train_index, root=args.data_root,
+                                    transform=eval_transform, feature_cache=feature_cache)
         if (args.augment or args.random_negative_prob > 0 or weak_active) else train_ds
     )
-    val_ds = IndexAssignedTripletDataset(args.val_index, root=args.data_root, transform=eval_transform)
+    val_ds = IndexAssignedTripletDataset(args.val_index, root=args.data_root,
+                                         transform=eval_transform, feature_cache=feature_cache)
 
     # persistent_workers=True (get_loader's default) would pickle train_ds into
     # long-lived worker processes once and never see it again — fatal for
