@@ -24,7 +24,7 @@ from contrastive_finetuning.models import build_rdd, build_masked_lg
 from contrastive_finetuning.train_common import (
     _lg_scores, _unwrap, add_common_args, batch_features, build_pseudo_accuracy_loader,
     build_wandb_tags, eval_epoch, eval_pseudo_accuracy, features_from_batch,
-    resolve_trained_models, run_lg_matching_grad, seed_all,
+    log_code_to_wandb, resolve_trained_models, run_lg_matching_grad, seed_all,
 )
 
 """
@@ -897,6 +897,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
             config=vars(args),
             init_kwargs={"wandb": {"name": args.run_name, "tags": build_wandb_tags(args)}},
         )
+        log_code_to_wandb(accelerator)
 
     # ── moving-negative baseline (before any training) ──
     baseline_ratio = None

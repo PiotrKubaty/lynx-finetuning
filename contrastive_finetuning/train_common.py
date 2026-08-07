@@ -121,6 +121,31 @@ def build_wandb_tags(args: argparse.Namespace) -> list[str]:
     return tags or ["run"]
 
 
+def log_code_to_wandb(accelerator: Accelerator, root: Path | None = None) -> None:
+    """Snapshot every .py file under `root` into the run's wandb code artifact.
+
+    Lets any run be traced back to the exact source that produced it, including
+    uncommitted edits (wandb only records the git SHA + diff otherwise). Defaults
+    to the repo root, i.e. the parent of this package, so `rdd/` and `rdd_patch/`
+    are captured alongside `contrastive_finetuning/`.
+
+    No-op on non-main processes and when no wandb tracker is active.
+    """
+    if not accelerator.is_main_process:
+        return
+    try:
+        run = accelerator.get_tracker("wandb", unwrap=True)
+    except ValueError:  # trackers configured, but none of them is wandb
+        return
+    # A blank GeneralTracker is what accelerate hands back when trackers only
+    # exist on the main process; it has no wandb run behind it.
+    if run is None or not hasattr(run, "log_code"):
+        return
+
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    run.log_code(str(root), include_fn=lambda path: path.endswith(".py"))
+
+
 def batch_features(feats: list[dict], image_h: int, image_w: int) -> dict:
     """
     Pack variable-length feature dicts into tensors for LightGlueMasked.
