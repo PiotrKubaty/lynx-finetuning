@@ -1,0 +1,7 @@
+# LoMa's train-dev branch contains the matcher API used by the adapter.
+git+https://github.com/davnords/LoMa.git@train-dev
+wandb
+safetensors
+tqdm
+Pillow
+torchvision

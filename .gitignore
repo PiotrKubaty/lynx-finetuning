@@ -215,3 +215,10 @@ old_dataset
 
 # wandb
 wandb/
+
+# LoMa experiment entry points are intentionally versioned despite the broad
+# generated-file patterns above.
+!requirements-loma.txt
+!slurm_scripts/train_loma.sh
+
+rdd
