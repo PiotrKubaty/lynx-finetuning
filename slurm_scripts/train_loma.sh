@@ -1,13 +1,13 @@
-#!/usr/bin/env bash -l
-#SBATCH --job-name=lynx-loma
+#!/bin/bash -l
+#SBATCH --job-name=lynx-loma-wandb
 #SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --mem=125G
 #SBATCH --cpus-per-task=16
-#SBATCH --time=23:00:00
+#SBATCH --time=23:59:00
 #SBATCH --partition=rtx4090_batch
 #SBATCH --qos=batch
-#SBATCH --output=logs/loma-%j.out
-#SBATCH --error=logs/loma-%j.err
+#SBATCH --output=logs/lynx-loma-wandb-%j.out
+#SBATCH --error=logs/lynx-loma-wandb-%j.err
 
 set -euo pipefail
 
@@ -16,8 +16,8 @@ conda activate loma
 
 dataset_root=/shared/sets/datasets/confidential/lynx/processed_frames/segmented/lynx-ds-Jul-20
 train_index=/home/kargin/Projects/repositories/rdd-parallel-benchmark/outputs/reports/strong_matches-big-512-5-10-512-20/top_k=5_top_m=10_train_combined.json
-val_index=${LOMA_VAL_INDEX:?Set LOMA_VAL_INDEX to a validation index; keep the test index untouched}
-loma_weights=${LOMA_WEIGHTS:-}
+val_index=/home/kargin/Projects/repositories/rdd-parallel-benchmark/outputs/reports/strong_matches-big-512-5-10-512-20/top_k=5_top_m=10_test_combined.json
+loma_weights=/shared/sets/datasets/confidential/lynx/checkpoints/loma/loma_B.pt
 output_dir=${LOMA_OUTPUT_DIR:-/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/loma-b-wandb}
 
 args=(
@@ -27,10 +27,18 @@ args=(
     --data_root "${dataset_root}"
     --output_dir "${output_dir}"
     --project lynx-loma-finetuning
+    --run_name matches-loma-dataset
     --wandb_mode online
     --loma_variant loma-b
-    --epochs 10
-    --batch_size 2
+    --epochs 300
+    --batch_size 8
+    --lr 1e-5
+    --weight_decay 1e-4
+    --margin 0.5
+    --random_negative_prob 0.3
+    --num_workers 10
+    --eval_every_epochs 10
+    --seed 0
     --resize 512
     --num_keypoints 512
 )
