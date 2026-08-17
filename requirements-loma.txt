@@ -5,3 +5,4 @@ safetensors
 tqdm
 Pillow
 torchvision
+accelerate

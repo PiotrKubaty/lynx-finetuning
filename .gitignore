@@ -220,5 +220,6 @@ wandb/
 # generated-file patterns above.
 !requirements-loma.txt
 !slurm_scripts/train_loma.sh
+!slurm_scripts/train_rdd.sh
 
 rdd
