@@ -6,6 +6,7 @@
 #SBATCH --time=23:59:00
 #SBATCH --partition=rtx4090_batch
 #SBATCH --qos=batch
+#SBATCH --exclude=c11,c15
 #SBATCH --output=logs/lynx-loma-wandb-%j.out
 #SBATCH --error=logs/lynx-loma-wandb-%j.err
 

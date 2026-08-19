@@ -6,6 +6,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=125G
 #SBATCH --time=23:59:00
+#SBATCH --exclude=c11,c15
 #SBATCH --export=ALL
 #SBATCH --output=logs/lynx-rdd-wandb-%j.out
 #SBATCH --error=logs/lynx-rdd-wandb-%j.err
