@@ -223,6 +223,7 @@ class IndexAssignedTripletDataset(Dataset):
         negative_mining_decay: float = 0.9,
         weak_queries: bool = False,
         weak_queries_prob: float = 0.0,
+        identity_candidate_prob: float = 0.0,
         feature_cache=None,
         return_meta: bool = False,
     ) -> None:
@@ -237,6 +238,7 @@ class IndexAssignedTripletDataset(Dataset):
         self.negative_mining_decay = negative_mining_decay
         self.weak_queries = weak_queries
         self.weak_queries_prob = weak_queries_prob
+        self.identity_candidate_prob = identity_candidate_prob
         self.return_meta = return_meta
         self._mining_scores: dict[tuple[str, str], float] = {}
 
@@ -248,6 +250,12 @@ class IndexAssignedTripletDataset(Dataset):
                 raise ValueError(f"Entry for {entry['query_frame']} has no positives.")
             if not entry.get("negatives"):
                 raise ValueError(f"Entry for {entry['query_frame']} has no negatives.")
+
+        self._video_pool: dict[str, list[str]] = {}
+        if identity_candidate_prob > 0:
+            if self.root is None:
+                raise ValueError("identity_candidate_prob > 0 requires `root` to be set")
+            self._video_pool = self._scan_query_video_pool()
 
         self._lynx_pool: dict[str, list[str]] = {}
         self._lynx_ids: list[str] = []
@@ -273,6 +281,46 @@ class IndexAssignedTripletDataset(Dataset):
             for img_path in lynx_dir.rglob("*.jpg"):
                 pool[lynx_dir.name].append(str(img_path.relative_to(self.root)))
         return dict(pool)
+
+    def _scan_query_video_pool(self) -> dict[str, list[str]]:
+        """Every frame of each video a query comes from, keyed by video id.
+
+        Only the queries' own videos are scanned (a couple of hundred
+        directories), which is all `_sample_identity_positive` can draw from.
+        """
+        pool: dict[str, list[str]] = {}
+        for entry in self._entries:
+            video = str(Path(entry["query_frame"]).parent)
+            if video not in pool:
+                pool[video] = sorted(
+                    str(p.relative_to(self.root))
+                    for p in (self.root / video).glob("frame_*.jpg")
+                )
+        return pool
+
+    def _sample_identity_positive(self, query_rel: str) -> tuple[str, str]:
+        """A positive the index never supplies: the query itself, or its own video.
+
+        Half the draws are the exact identity pair. Nothing in the frozen index
+        is anywhere near this easy — every mined positive is cross-video — and
+        the dense score matrix shows the model losing the identity case
+        entirely over 300 epochs (self-match falls from 0.643 to 0.198, from 96%
+        to 29% of keypoints matched, and stops being the row maximum for even a
+        single frame). These pairs are the cheapest available anchor against
+        that: no mining, and with --keypoint_cache both sides are the same
+        cached features, so the pair costs one extra matcher call and no I/O.
+
+        The other half is a different frame of the same video: still far easier
+        than a mined positive, but not degenerate, so the model cannot satisfy
+        the margin by special-casing literally identical inputs.
+        """
+        if random.random() < 0.5:
+            return query_rel, "identity"
+        others = [p for p in self._video_pool.get(str(Path(query_rel).parent), [])
+                  if p != query_rel]
+        if not others:
+            return query_rel, "identity"
+        return random.choice(others), "same_video"
 
     def _lynx_id(self, rel_path: str) -> str:
         return Path(rel_path).parts[1]
@@ -361,12 +409,18 @@ class IndexAssignedTripletDataset(Dataset):
     def __getitem__(self, index: int):
         if self.weak_queries and random.random() < self.weak_queries_prob:
             query_rel, pos_rel, neg_rel, meta = self._sample_weak_triplet()
+            meta["pos_source"] = "weak"
         else:
             entry = self._entries[index]
             query_rel = entry["query_frame"]
-            pos_rel = random.choice(entry["positives"])
+            if (self.identity_candidate_prob > 0
+                    and random.random() < self.identity_candidate_prob):
+                pos_rel, pos_source = self._sample_identity_positive(query_rel)
+            else:
+                pos_rel, pos_source = random.choice(entry["positives"]), "index"
             neg_rel, meta = self._sample_negative(entry)
             meta["is_weak_query"] = False
+            meta["pos_source"] = pos_source
 
         if self.feature_cache is not None:
             query_img = self.feature_cache.load_padded(query_rel)

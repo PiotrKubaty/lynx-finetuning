@@ -6,6 +6,7 @@ import copy
 import math
 import random
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +20,7 @@ from torchvision import transforms
 from torch.utils.data import Subset
 
 from contrastive_finetuning.keypoint_cache import open_cache_for_run
+from contrastive_finetuning.remine_index import add_remine_args, remine_index
 from contrastive_finetuning.loading import IndexAssignedTripletDataset, get_loader
 from contrastive_finetuning.models import build_rdd, build_masked_lg
 from contrastive_finetuning.train_common import (
@@ -160,7 +162,38 @@ def parse_args() -> argparse.Namespace:
         help="Probability of drawing a --weak_queries sample instead of the index-driven "
              "query, per training item.",
     )
+    p.add_argument(
+        "--identity_candidate_prob", type=float, default=0.0,
+        help="Per item, the probability that the positive is NOT taken from the index "
+             "but is the query frame itself (half the time) or another frame of the "
+             "query's own video (the other half). 0 (default) keeps positives "
+             "index-only; 0.05 is a sensible starting point. Every mined positive is "
+             "cross-video, so nothing in the index anchors the easy end of the scale — "
+             "and the dense score matrix shows the model losing it completely over 300 "
+             "epochs (self-match 0.643 -> 0.198, 96%% -> 29%% of keypoints matched, and "
+             "the matrix diagonal stops being the row maximum for even one frame). "
+             "Replaces an index positive rather than adding a term, so it costs nothing.",
+    )
+    p.add_argument(
+        "--remine_every", type=int, default=0,
+        help="Re-mine the training index's candidate pools with the current checkpoint "
+             "every N epochs (0 = never, the frozen-index behaviour). See "
+             "contrastive_finetuning.remine_index for what a round costs and why the "
+             "gallery is thinned rather than shortlisted.",
+    )
+    p.add_argument(
+        "--remine_fraction", type=int, default=1,
+        help="Refresh only 1/f of the entries per re-mining round, round-robin, so each "
+             "round costs 1/f as much and the index is refreshed continuously rather "
+             "than in rare jumps (the ANCE pattern). With --remine_every 2 and "
+             "--remine_fraction 4, every entry is refreshed every 8 epochs.",
+    )
+    add_remine_args(p)
     args = p.parse_args()
+    if not (0.0 <= args.identity_candidate_prob <= 1.0):
+        p.error("--identity_candidate_prob must be in [0, 1]")
+    if args.remine_fraction < 1:
+        p.error("--remine_fraction must be >= 1")
     if args.moving_negative_prob is not None:
         if args.random_negative_prob <= 0:
             p.error("--moving_negative_prob requires --random_negative_prob > 0")
@@ -749,7 +782,10 @@ def run_training_lg(args: argparse.Namespace) -> None:
     moving_active  = args.moving_negative_prob is not None
     mining_active  = args.negative_mining
     weak_active    = args.weak_queries
-    dataset_mutates = moving_active or mining_active  # see persistent_workers note below
+    remine_active  = args.remine_every > 0
+    # persistent_workers would pickle the dataset into long-lived workers once;
+    # re-mining rewrites train_ds._entries between epochs, so it has to be off.
+    dataset_mutates = moving_active or mining_active or remine_active
 
     # ── keypoint cache ──
     # Opened before the datasets so a stale/mismatched cache fails here, on the
@@ -774,6 +810,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
         negative_mining_decay=args.negative_mining_decay,
         weak_queries=weak_active,
         weak_queries_prob=args.weak_queries_prob,
+        identity_candidate_prob=args.identity_candidate_prob,
         # Always on: train_epoch_lg uses neg_source/is_weak_query to split
         # train/skip_rate_* by pair type regardless of which (if any) of the
         # adaptive-sampling flags below are active.
@@ -787,7 +824,8 @@ def run_training_lg(args: argparse.Namespace) -> None:
     train_ds_eval = (
         IndexAssignedTripletDataset(args.train_index, root=args.data_root,
                                     transform=eval_transform, feature_cache=feature_cache)
-        if (args.augment or args.random_negative_prob > 0 or weak_active) else train_ds
+        if (args.augment or args.random_negative_prob > 0 or weak_active
+            or args.identity_candidate_prob > 0 or remine_active) else train_ds
     )
     val_ds = IndexAssignedTripletDataset(args.val_index, root=args.data_root,
                                          transform=eval_transform, feature_cache=feature_cache)
@@ -941,6 +979,9 @@ def run_training_lg(args: argparse.Namespace) -> None:
         )
 
     # ── loop ──
+    # Gallery/query features for re-mining are loaded once into here and reused
+    # every round — see remine_index's `packs`.
+    remine_packs: dict = {}
     for epoch in range(args.epochs):
         epoch_loss, global_step, neg_gap_stats = train_epoch_lg(
             accelerator, rdd, lg, eval_lg, optimizer, train_loader,
@@ -971,6 +1012,30 @@ def run_training_lg(args: argparse.Namespace) -> None:
         if mining_active and neg_gap_stats is not None and neg_gap_stats["mining_observations"]:
             train_ds.update_mining_stats(neg_gap_stats["mining_observations"])
 
+        remine_time = 0.0
+        if remine_active and (epoch + 1) % args.remine_every == 0:
+            # Refresh the candidate pools with the weights as of this epoch. Every
+            # rank runs remine_index and gathers the same merged result, so all
+            # ranks keep identical entries — train_ds is sampled independently per
+            # rank, and a divergent index would silently desynchronise them.
+            t_remine = time.perf_counter()
+            lg.eval()
+            round_id = (epoch + 1) // args.remine_every - 1
+            rows = [i for i in range(len(train_ds._entries))
+                    if i % args.remine_fraction == round_id % args.remine_fraction]
+            cand_split = Path(train_ds._entries[0]["positives"][0]).parts[0]
+            train_ds._entries = remine_index(
+                _unwrap(eval_lg), train_ds._entries, args.data_root, cand_split,
+                feature_cache, _unwrap(rdd), accelerator.device, args, rows, accelerator,
+                packs=remine_packs,
+            )
+            lg.train(train_lg)
+            remine_time = time.perf_counter() - t_remine
+            accelerator.print(
+                f"epoch {epoch}: re-mined {len(rows)}/{len(train_ds._entries)} entries "
+                f"in {remine_time / 60:.1f} min"
+            )
+
         t_eval_start = time.perf_counter()
         do_eval = epoch % args.eval_every_epochs == args.eval_every_epochs - 1
         if do_eval:
@@ -988,6 +1053,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
             "train/epoch_loss":           epoch_loss,
             "train/lr":                   lr,
             "time/epoch_eval_s":          epoch_eval_time,
+            "time/remine_s":              remine_time,
             # Logged unconditionally (not just when moving_neg/* fires) so the
             # wandb curve stays continuous even on epochs with zero sampled
             # random negatives, and so --negative_mining alone (static prob,
