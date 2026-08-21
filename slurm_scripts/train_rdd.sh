@@ -8,8 +8,8 @@
 #SBATCH --time=23:59:00
 #SBATCH --exclude=c11,c15
 #SBATCH --export=ALL
-#SBATCH --output=logs/lynx-rdd-wandb-%j.out
-#SBATCH --error=logs/lynx-rdd-wandb-%j.err
+#SBATCH --output=logs/lynx-rdd-wandb/lynx-rdd-wandb-%j.out
+#SBATCH --error=logs/lynx-rdd-wandb/lynx-rdd-wandb-%j.err
 
 set -euo pipefail
 

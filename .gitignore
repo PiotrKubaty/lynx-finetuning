@@ -203,6 +203,14 @@ old_dataset
 *.yml
 *.md
 
+# Generic WildlifeReID pipeline sources
+!WILDLIFE.md
+!slurm_scripts/prepare_wildlife.sh
+!slurm_scripts/build_wildlife_rdd_cache.sh
+!slurm_scripts/build_wildlife_loma_cache.sh
+!slurm_scripts/train_wildlife_rdd.sh
+!slurm_scripts/train_wildlife_loma.sh
+
 # torch
 *.pt
 *.pth
