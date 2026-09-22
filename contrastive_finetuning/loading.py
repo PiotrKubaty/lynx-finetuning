@@ -8,11 +8,13 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, default_collate
 from torchvision.datasets import ImageFolder
 from torchvision.datasets.folder import default_loader
 from torchvision import transforms
 from tqdm import tqdm
+
+from contrastive_finetuning.process import canonical_hw, resize_image_canonical
 
 
 ShapeSignature = tuple[tuple[int, int], tuple[int, int], tuple[tuple[int, int], ...]]
@@ -320,9 +322,18 @@ class IndexAssignedTripletDataset(Dataset):
         frame_jitter_prob: float = 1.0,
         feature_cache=None,
         return_meta: bool = False,
+        resize: int | None = None,
     ) -> None:
         self.root = Path(root) if root is not None else None
         self.feature_cache = feature_cache
+        # Without a feature cache every frame is decoded here and RDD runs on it. The
+        # datasets this code trains on (CzechLynx, WildlifeReID) hold per-animal crops of
+        # different sizes, so the raw tensors cannot be stacked into a batch at all; resizing
+        # each one to its canonical grid (long side == resize, div-by-32 — exactly what
+        # resize_long_side would do later on the GPU) both makes most of them stackable and
+        # moves the interpolation into the DataLoader workers. What is left over is handled
+        # by collate_variable_images + features_from_batch's shape grouping.
+        self.resize = resize
         self.transform = transform
         self.query_transform = query_transform or transform
         self._loader = loader or default_loader
@@ -636,6 +647,8 @@ class IndexAssignedTripletDataset(Dataset):
             return self.feature_cache.image_hw(rel)
         image = self._loader(self._full_path(rel))
         width, height = image.size
+        if self.resize:
+            return canonical_hw(height, width, self.resize)
         return int(height), int(width)
 
     def prepare_shape_plan(self, epoch: int, seed: int) -> dict[int, ShapeSignature]:
@@ -733,8 +746,17 @@ class IndexAssignedTripletDataset(Dataset):
             if self.transform is not None:
                 pos_img = self.transform(pos_img)
                 neg_imgs = [self.transform(i) for i in neg_imgs]
+            if self.resize:
+                query_img = resize_image_canonical(query_img, self.resize)
+                pos_img = resize_image_canonical(pos_img, self.resize)
+                neg_imgs = [resize_image_canonical(i, self.resize) for i in neg_imgs]
 
-            neg_img = neg_imgs[0] if self.num_negatives == 1 else torch.stack(neg_imgs)
+            if self.num_negatives == 1:
+                neg_img = neg_imgs[0]
+            elif len({tuple(i.shape) for i in neg_imgs}) == 1:
+                neg_img = torch.stack(neg_imgs)
+            else:
+                neg_img = neg_imgs  # mixed shapes: kept as a list, see collate_variable_images
 
         if self.return_meta:
             return query_img, pos_img, neg_img, meta
@@ -832,12 +854,14 @@ class PseudoAccuracyDataset(Dataset):
         query_transform: transforms.Compose | None = None,
         loader=None,
         feature_cache=None,
+        resize: int | None = None,
     ) -> None:
         self.root = Path(root) if root is not None else None
         self.feature_cache = feature_cache
         self.transform = transform
         self.query_transform = query_transform or transform
         self._loader = loader or default_loader
+        self.resize = resize
         self.entries = entries
 
         n_pos = {len(e["positives"]) for e in entries}
@@ -875,8 +899,15 @@ class PseudoAccuracyDataset(Dataset):
         cand_imgs = [self._loader(self._full_path(p)) for p in cand_paths]
         if self.transform is not None:
             cand_imgs = [self.transform(img) for img in cand_imgs]
+        if self.resize:
+            query_img = resize_image_canonical(query_img, self.resize)
+            cand_imgs = [resize_image_canonical(img, self.resize) for img in cand_imgs]
 
-        return query_img, torch.stack(cand_imgs), index
+        # A query's candidates come from different animals and videos, so their frames
+        # rarely share a size even after the canonical resize; only stack what fits.
+        if len({tuple(img.shape) for img in cand_imgs}) == 1:
+            return query_img, torch.stack(cand_imgs), index
+        return query_img, cand_imgs, index
 
 
 class LabeledImageFolder(ImageFolder):
@@ -949,6 +980,31 @@ class BalancedBatchSampler(Sampler):
             yield batch
 
 
+def collate_variable_images(batch):
+    """Default collate that keeps differently-shaped images as lists.
+
+    The frames of these datasets are per-animal crops, so a batch (or one query's
+    candidate pool) regularly mixes spatial sizes and `torch.stack` cannot build a single
+    tensor. Uniform batches keep the stacked fast path — cached-feature batches (dicts) and
+    metadata go through torch's own collate untouched — while a mixed batch becomes a plain
+    list of tensors that `features_from_batch` groups by shape before running RDD.
+    """
+    first = batch[0]
+    if isinstance(first, torch.Tensor):
+        if len({tuple(item.shape) for item in batch}) == 1:
+            return torch.stack(list(batch))
+        return list(batch)
+    if isinstance(first, tuple):
+        return tuple(collate_variable_images([item[i] for item in batch]) for i in range(len(first)))
+    if isinstance(first, list):  # per-item image list (candidates, K negatives)
+        shapes = {tuple(image.shape) for item in batch for image in item}
+        lengths = {len(item) for item in batch}
+        if len(shapes) == 1 and len(lengths) == 1:
+            return torch.stack([torch.stack(item) for item in batch])
+        return [list(item) for item in batch]
+    return default_collate(batch)
+
+
 def get_loader(
     data: Dataset,
     batch_size: int | None = None,
@@ -958,6 +1014,7 @@ def get_loader(
     persistent_workers=True,
     seed: int | None = None,
     batch_sampler: Sampler[list[int]] | None = None,
+    collate_fn=None,
 ):
     if batch_sampler is not None and (batch_size is not None or shuffle):
         raise ValueError("batch_sampler is mutually exclusive with batch_size and shuffle")
@@ -972,6 +1029,8 @@ def get_loader(
         "persistent_workers": persistent_workers,
         "generator": generator,
     }
+    if collate_fn is not None:
+        kwargs["collate_fn"] = collate_fn
     if batch_sampler is not None:
         kwargs["batch_sampler"] = batch_sampler
     else:

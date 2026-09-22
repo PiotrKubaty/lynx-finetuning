@@ -15,8 +15,12 @@ from torch.utils.data import Subset
 
 from rdd.RDD.utils import to_pixel_coords
 from contrastive_finetuning.keypoint_cache import is_cached_batch, unpad_cached_features
-from contrastive_finetuning.loading import PseudoAccuracyDataset, get_loader
-from contrastive_finetuning.process import align_tensors_to_max_length
+from contrastive_finetuning.loading import (
+    PseudoAccuracyDataset,
+    collate_variable_images,
+    get_loader,
+)
+from contrastive_finetuning.process import align_tensors_to_max_length, canonical_hw
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -105,9 +109,9 @@ def resolve_trained_models(trained_model: str) -> tuple[bool, bool]:
 def resize_long_side(images: torch.Tensor, size: int) -> torch.Tensor:
     """Resize so the long side == size and dims are div-by-32."""
     _, _, H, W = images.shape
-    scale = size / max(H, W)
-    new_H = int(H * scale) // 32 * 32
-    new_W = int(W * scale) // 32 * 32
+    new_H, new_W = canonical_hw(H, W, size)
+    if (int(H), int(W)) == (new_H, new_W):
+        return images.float()
     return F.interpolate(images.float(), (new_H, new_W), mode="bilinear", align_corners=False)
 
 
@@ -409,11 +413,53 @@ def features_from_batch(
     """
     if is_cached_batch(batch):
         return unpad_cached_features(batch, device)
+    if isinstance(batch, (list, tuple)):
+        return _features_from_mixed_shapes(batch, rdd, resize, device, chunk_size)
     images = resize_long_side(batch, resize).to(device)
     h, w = images.shape[-2:]
     if chunk_size is None:
         return extract_train(rdd, images), h, w
     return _extract_chunked(rdd, images, chunk_size), h, w
+
+
+def _features_from_mixed_shapes(
+    images: list, rdd: torch.nn.Module, resize: int, device: torch.device,
+    chunk_size: int | None = None,
+) -> tuple[list[dict], list[int], list[int]]:
+    """Features for a batch whose images differ in size (collate_variable_images).
+
+    RDD's forward needs one spatial size per call, so the batch is split into groups of
+    equal shape, each group is extracted as its own (smaller) batch, and the features are
+    reassembled in the caller's order with per-frame H/W — the same per-frame layout the
+    cached path returns, which every consumer downstream already accepts.
+    """
+    flat = _flatten_image_list(images)
+    groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for position, image in enumerate(flat):
+        groups[canonical_hw(*image.shape[-2:], resize)].append(position)
+    feats: list[dict | None] = [None] * len(flat)
+    heights: list[int] = [0] * len(flat)
+    widths: list[int] = [0] * len(flat)
+    for positions in groups.values():
+        batch = torch.stack([flat[position] for position in positions])
+        group_feats, h, w = features_from_batch(batch, rdd, resize, device, chunk_size)
+        for feat, position in zip(group_feats, positions):
+            feats[position] = feat
+            heights[position], widths[position] = int(h), int(w)
+    return [f for f in feats if f is not None], heights, widths
+
+
+def _flatten_image_list(images) -> list[torch.Tensor]:
+    """Flatten a (possibly nested) collated image list into per-frame tensors."""
+    flat: list[torch.Tensor] = []
+    for item in images:
+        if isinstance(item, torch.Tensor) and item.dim() == 4:  # a stacked sub-batch
+            flat.extend(item)
+        elif isinstance(item, (list, tuple)):
+            flat.extend(_flatten_image_list(item))
+        else:
+            flat.append(item)
+    return flat
 
 
 def _extract_chunked(rdd: torch.nn.Module, images: torch.Tensor, chunk_size: int) -> list[dict]:
@@ -458,10 +504,19 @@ def _lg_scores(pred: dict, q_data: dict, g_data: dict) -> torch.Tensor:
     return sums / torch.minimum(n_q, n_g)
 
 
+def _to_device(batch, device: torch.device):
+    """Move a collated image batch — a tensor or a (nested) list of them — to `device`."""
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    return [_to_device(item, device) for item in batch]
+
+
 def _pseudo_batch_dims(cand_batch) -> tuple[int, int]:
     """(queries, candidates per query) for a PseudoAccuracyDataset batch."""
     if is_cached_batch(cand_batch):
         return tuple(cand_batch["n_keypoints"].shape[:2])
+    if isinstance(cand_batch, list):  # mixed candidate shapes, one list per query
+        return len(cand_batch), len(cand_batch[0])
     return int(cand_batch.shape[0]), int(cand_batch.shape[1])
 
 
@@ -474,6 +529,8 @@ def _flatten_candidates(cand_batch):
     """
     if is_cached_batch(cand_batch):
         return cand_batch
+    if isinstance(cand_batch, list):  # mixed shapes: flatten the nesting, keep the order
+        return _flatten_image_list(cand_batch)
     B, n_cand, C, H, W = cand_batch.shape
     return cand_batch.view(B * n_cand, C, H, W)
 
@@ -516,10 +573,12 @@ def build_pseudo_accuracy_loader(
             query_transform=base_ds.query_transform,
             loader=base_ds._loader,
             feature_cache=base_ds.feature_cache,
+            resize=getattr(base_ds, "resize", None),
         )
         loader = get_loader(
             ds, batch_size=args.eval_batch_size, shuffle=False,
             num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
+            collate_fn=collate_variable_images,
         )
         prepared.append((accelerator.prepare(loader), ds))
 
@@ -564,8 +623,8 @@ def eval_pseudo_accuracy(
             disable=not accelerator.is_main_process
         ):
             if not is_cached_batch(query_batch):
-                query_batch = query_batch.to(device)
-                cand_batch = cand_batch.to(device)
+                query_batch = _to_device(query_batch, device)
+                cand_batch = _to_device(cand_batch, device)
             B, n_cand = _pseudo_batch_dims(cand_batch)
             feats_q, H_q, W_q = features_from_batch(
                 query_batch, _unwrap(rdd), args.resize, device, chunk_size=args.batch_size)

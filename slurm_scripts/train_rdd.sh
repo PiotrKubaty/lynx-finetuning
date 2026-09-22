@@ -6,21 +6,24 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=125G
 #SBATCH --time=23:59:00
-#SBATCH --exclude=c11,c15
+#SBATCH --exclude=c11
 #SBATCH --export=ALL
 #SBATCH --output=logs/lynx-rdd-wandb/lynx-rdd-wandb-%j.out
 #SBATCH --error=logs/lynx-rdd-wandb/lynx-rdd-wandb-%j.err
 
 set -euo pipefail
 
-source /shared/results/common/kargin/tck_miniconda3/etc/profile.d/conda.sh
-conda activate rdd
+source "${LYNX_FINETUNING_ROOT:-$PWD}/env.sh"
+activate_conda_env "${CONDA_ENV_RDD}"
 
-dataset_root=/shared/sets/datasets/confidential/lynx/processed_frames/segmented/lynx-ds-Jul-20
-train_index=/home/kargin/Projects/repositories/rdd-parallel-benchmark/outputs/reports/strong_matches-big-512-5-10-512-20/top_k=5_top_m=10_train_combined.json
-val_index=/home/kargin/Projects/repositories/rdd-parallel-benchmark/outputs/reports/strong_matches-big-512-5-10-512-20/top_k=5_top_m=10_test_combined.json
-rdd_weights=/home/kargin/Projects/repositories/lynx-finetuning/rdd/weights/RDD-v2.pth
-lg_weights=/home/kargin/Projects/repositories/lynx-finetuning/rdd/weights/RDD_lg-v2.pth
+# Original (confidential) lynx dataset run. The mined index is not part of this repository:
+# point LYNX_TRAIN_INDEX / LYNX_VAL_INDEX at the combined JSON files produced by
+# rdd-parallel-benchmark's spawn_find_strong_matches.sh.
+dataset_root=${LYNX_DATASET_ROOT:-/shared/sets/datasets/confidential/lynx/processed_frames/segmented/lynx-ds-Jul-20}
+train_index=${LYNX_TRAIN_INDEX:?set LYNX_TRAIN_INDEX to the mined train index}
+val_index=${LYNX_VAL_INDEX:?set LYNX_VAL_INDEX to the mined test index}
+rdd_weights=${RDD_WEIGHTS}
+lg_weights=${LG_WEIGHTS}
 output_dir=${RDD_OUTPUT_DIR:-/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/matches-lg-wandb}
 rdd_cache=${RDD_KEYPOINT_CACHE:-/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/rdd-keypoint-cache-resize512-topk512}
 cache_batch_size=${RDD_CACHE_BATCH_SIZE:-32}

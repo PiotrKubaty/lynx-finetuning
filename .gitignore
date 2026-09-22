@@ -231,3 +231,7 @@ wandb/
 !slurm_scripts/train_rdd.sh
 
 rdd
+
+# sibling repositories symlinked here for browsing only (scripts never rely on them)
+/rdd-parallel-benchmark
+/explainable_individual_reidentification

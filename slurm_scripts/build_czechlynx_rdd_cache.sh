@@ -5,18 +5,18 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=125G
-#SBATCH --exclude=c11,c15
+#SBATCH --exclude=c11
 #SBATCH --time=23:59:00
 #SBATCH --output=logs/czechlynx-rdd-cache/czechlynx-rdd-cache-%j.out
 #SBATCH --error=logs/czechlynx-rdd-cache/czechlynx-rdd-cache-%j.err
 
 set -euo pipefail
-source /shared/results/common/kargin/tck_miniconda3/etc/profile.d/conda.sh
-conda activate rdd
+source "${LYNX_FINETUNING_ROOT:-$PWD}/env.sh"
+activate_conda_env "${CONDA_ENV_RDD}"
 
-dataset_root=${CZECHLYNX_ROOT:-/shared/sets/datasets/vision/czechlynx/CzechLynx_processed_time_closed}
-cache_root=${CZECHLYNX_RDD_CACHE:-/shared/sets/datasets/vision/czechlynx/checkpoints/czechlynx-time-closed/rdd-cache}
-rdd_weights=${RDD_WEIGHTS:-/home/kargin/Projects/repositories/lynx-finetuning/rdd/weights/RDD-v2.pth}
+dataset_root=${CZECHLYNX_ROOT:-${CZECHLYNX_VIEW_ROOT}}
+cache_root=${CZECHLYNX_RDD_CACHE:-${CHECKPOINTS_ROOT}/czechlynx-time-closed/rdd-cache}
+rdd_weights=${RDD_WEIGHTS}
 
 mkdir -p logs
 python -m contrastive_finetuning.build_keypoint_cache \

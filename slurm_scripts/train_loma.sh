@@ -6,23 +6,24 @@
 #SBATCH --time=23:59:00
 #SBATCH --partition=rtx4090_batch
 #SBATCH --qos=batch
-#SBATCH --exclude=c11,c15
+#SBATCH --exclude=c11
 #SBATCH --output=logs/lynx-loma-wandb/lynx-loma-wandb-%j.out
 #SBATCH --error=logs/lynx-loma-wandb/lynx-loma-wandb-%j.err
 
 set -euo pipefail
 
-source /shared/results/common/kargin/tck_miniconda3/etc/profile.d/conda.sh
-conda activate loma
+source "${LYNX_FINETUNING_ROOT:-$PWD}/env.sh"
+activate_conda_env "${CONDA_ENV_LOMA}"
 
-dataset_root=/shared/sets/datasets/confidential/lynx/processed_frames/segmented/lynx-ds-Jul-20
-train_index=/home/kargin/Projects/repositories/rdd-parallel-benchmark/outputs/reports/strong_matches-big-512-5-10-512-20/top_k=5_top_m=10_train_combined.json
-val_index=/home/kargin/Projects/repositories/rdd-parallel-benchmark/outputs/reports/strong_matches-big-512-5-10-512-20/top_k=5_top_m=10_test_combined.json
-loma_weights=/shared/sets/datasets/confidential/lynx/checkpoints/loma/loma_B.pt
+# Original (confidential) lynx dataset run; see train_rdd.sh for the index variables.
+dataset_root=${LYNX_DATASET_ROOT:-/shared/sets/datasets/confidential/lynx/processed_frames/segmented/lynx-ds-Jul-20}
+train_index=${LYNX_TRAIN_INDEX:?set LYNX_TRAIN_INDEX to the mined train index}
+val_index=${LYNX_VAL_INDEX:?set LYNX_VAL_INDEX to the mined test index}
+loma_weights=${LOMA_WEIGHTS}
 output_dir=${LOMA_OUTPUT_DIR:-/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/loma-b-wandb}
 loma_cache=${LOMA_KEYPOINT_CACHE:-/shared/sets/datasets/confidential/lynx/checkpoints/contrastive-finetuning/loma-b-cache-resize512-kp512}
 cache_batch_size=${LOMA_CACHE_BATCH_SIZE:-4}
-benchmark_root=/home/kargin/Projects/repositories/rdd-parallel-benchmark
+benchmark_root=${RDD_BENCHMARK_ROOT}
 
 cache_args=(
     --dataset_root "${dataset_root}"

@@ -5,7 +5,10 @@ import contextlib
 import copy
 import math
 import random
+import re
 import time
+
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -21,11 +24,12 @@ from torch.utils.data import Subset
 from contrastive_finetuning.keypoint_cache import is_cached_batch, open_cache_for_run
 from contrastive_finetuning.loading import (
     IndexAssignedTripletDataset,
+    collate_variable_images,
     get_loader,
 )
 from contrastive_finetuning.models import build_rdd, build_masked_lg
 from contrastive_finetuning.train_common import (
-    _flatten_candidates, _lg_scores, _pseudo_batch_dims, _repeat_image_sizes, _unwrap,
+    _flatten_candidates, _lg_scores, _pseudo_batch_dims, _repeat_image_sizes, _to_device, _unwrap,
     add_common_args, batch_features, build_pseudo_accuracy_loader, build_wandb_tags,
     eval_epoch, eval_pseudo_accuracy, features_from_batch, resolve_trained_models,
     run_lg_partitioned, seed_all,
@@ -387,6 +391,21 @@ def parse_args() -> argparse.Namespace:
     )
     add_common_args(p)
     p.add_argument(
+        "--rdd_train_component", choices=["all", "descriptor"], default="all",
+        help="When --trained_model includes rdd, train the full RDD detector+descriptor "
+             "(default/legacy) or only RDD's descriptor while freezing its detector.",
+    )
+    p.add_argument(
+        "--resume", type=Path, default=None,
+        help="An epoch_NN checkpoint directory written by this trainer (accelerator.save_state); "
+             "training continues from the following epoch with the prepared model(s), optimizer, "
+             "LR schedule and RNG states restored, skipping the pre-training baseline eval. Meant "
+             "for chaining wall-time-limited jobs (a descriptor run does not fit in 24 h). Only "
+             "the stateless default configuration resumes exactly: --adaptive_margin, "
+             "--negative_mining, hard sampling, --ema_decay and --distill_model keep per-run state "
+             "that is not checkpointed and are rejected together with --resume.",
+    )
+    p.add_argument(
         "--eval_only", action="store_true",
         help="Run the pre-training val pseudo-accuracy eval — the exact eval_pseudo_accuracy "
              "call every epoch's val/video_accuracy is computed with, including RDD's "
@@ -744,6 +763,22 @@ def parse_args() -> argparse.Namespace:
             p.error("--moving_negative_prob must be in [0, 1]")
     if args.negative_mining and args.random_negative_prob <= 0:
         p.error("--negative_mining requires --random_negative_prob > 0")
+    if args.rdd_train_component == "descriptor" and "rdd" not in args.trained_model.split("+"):
+        p.error("--rdd_train_component descriptor requires --trained_model to include rdd")
+    if args.resume is not None:
+        if not (args.resume / "random_states_0.pkl").is_file() or resume_epoch(args.resume) is None:
+            p.error(f"--resume must be an epoch_NN directory written by accelerator.save_state: {args.resume}")
+        stateful = {
+            "--adaptive_margin": args.adaptive_margin, "--negative_mining": args.negative_mining,
+            "--hard_positive_sampling": args.hard_positive_sampling,
+            "--hard_negative_sampling": args.hard_negative_sampling,
+            "--moving_negative_prob": args.moving_negative_prob is not None,
+            "--ema_decay": args.ema_decay > 0, "--distill_model": args.distill_model != "none",
+            "--eval_only": args.eval_only, "--warmup_steps": args.warmup_steps > 0,
+        }
+        active = [flag for flag, on in stateful.items() if on]
+        if active:
+            p.error(f"--resume cannot restore the per-run state of {', '.join(active)}")
     if args.weak_queries and not (0.0 < args.weak_queries_prob <= 1.0):
         p.error("--weak_queries requires --weak_queries_prob in (0, 1]")
     if args.distill_model != "none":
@@ -818,6 +853,40 @@ def parse_args() -> argparse.Namespace:
     if (args.frame_jitter_query > 0 or args.frame_jitter_db > 0) and args.frame_jitter_prob == 0:
         p.error("--frame_jitter_prob 0 silently disables --frame_jitter_query/--frame_jitter_db")
     return args
+
+
+def resume_epoch(checkpoint_dir: Path) -> int | None:
+    """Epoch number encoded in an ``epoch_NN`` checkpoint directory name, else None."""
+    match = re.fullmatch(r"epoch_(\d+)", checkpoint_dir.name)
+    return int(match.group(1)) if match else None
+
+
+def set_rdd_training_mode(rdd: torch.nn.Module, training: bool, component: str) -> None:
+    """Set RDD train/eval behavior while keeping frozen detector state fixed."""
+    model = _unwrap(rdd)
+    model.train(training)
+    if training and component == "descriptor":
+        model.detector.eval()
+        model.descriptor.train(True)
+
+
+def configure_rdd_trainable_component(
+    rdd: torch.nn.Module, train_rdd: bool, component: str
+) -> None:
+    """Freeze RDD by default, optionally enabling its descriptor or all weights."""
+    model = _unwrap(rdd)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    if not train_rdd:
+        return
+    if component == "descriptor":
+        for parameter in model.descriptor.parameters():
+            parameter.requires_grad_(True)
+    elif component == "all":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    else:
+        raise ValueError(f"unsupported RDD training component {component!r}")
 
 
 # ── loss ──────────────────────────────────────────────────────────────────────
@@ -1092,6 +1161,7 @@ def measure_negative_gap(
             get_loader(
                 dataset, batch_size=args.batch_size, shuffle=True,
                 num_workers=args.num_workers, persistent_workers=False,
+                collate_fn=collate_variable_images,
             ),
             num_processes=accelerator.num_processes,
             process_index=accelerator.process_index,
@@ -1613,8 +1683,8 @@ def measure_pretrained_positive_scores(
             disable=not accelerator.is_main_process
         ):
             if not is_cached_batch(query_batch):
-                query_batch = query_batch.to(device)
-                cand_batch  = cand_batch.to(device)
+                query_batch = _to_device(query_batch, device)
+                cand_batch  = _to_device(cand_batch, device)
             B, n_cand = _pseudo_batch_dims(cand_batch)
             feats_q, H_q, W_q = features_from_batch(
                 query_batch, _unwrap(rdd), args.resize, device, chunk_size=args.batch_size)
@@ -1760,7 +1830,7 @@ def train_epoch_lg(
     --adaptive_margin's input).
     """
     train_rdd, train_lg = resolve_trained_models(args.trained_model)
-    _unwrap(rdd).train(train_rdd)
+    set_rdd_training_mode(rdd, train_rdd, args.rdd_train_component)
     lg.train(train_lg)
 
     # --adaptive_margin passes the live (per-epoch) margin; everything else
@@ -1838,7 +1908,7 @@ def train_epoch_lg(
         step_resize = args.resize
         if args.multi_scale_max > 0:
             step_resize = random.choice(range(args.multi_scale_min, args.multi_scale_max + 1, 32))
-        if K > 1 and not is_cached_batch(negatives):
+        if K > 1 and isinstance(negatives, torch.Tensor) and not is_cached_batch(negatives):
             # (B, K, C, H, W) from the dataset -> one flat (B*K) negative
             # batch, row-major (sample, negative) — the layout every flat
             # per-negative structure below (stats/meta/confs) shares. Cached
@@ -2170,7 +2240,7 @@ def train_epoch_lg(
             mini_train_m = eval_epoch(accelerator, rdd, eval_lg, mini_train_loader, args, prefix="mini_train")
             mini_val_m   = eval_epoch(accelerator, rdd, eval_lg, mini_val_loader,   args, prefix="mini_val")
             mini_eval_time += time.perf_counter() - t_mini_start
-            _unwrap(rdd).train(train_rdd)
+            set_rdd_training_mode(rdd, train_rdd, args.rdd_train_component)
             lg.train(train_lg)
             if accelerator.is_main_process:
                 accelerator.log({**mini_train_m, **mini_val_m, "progress": progress}, step=global_step)
@@ -2341,6 +2411,11 @@ def run_training_lg(args: argparse.Namespace) -> None:
 
     # ── data ──
     train_transform, eval_transform = build_transforms(args.augment)
+    # Images (no cache) are resized to their canonical grid in the DataLoader workers: the
+    # frames are per-animal crops of many different sizes, which cannot be collated into one
+    # tensor otherwise, and RDD would resize them the same way a moment later anyway.
+    # --multi_scale_* still rescales per step, from the canonical size instead of the raw one.
+    loader_resize = None if feature_cache is not None else args.resize
     train_ds = IndexAssignedTripletDataset(
         args.train_index, root=args.data_root, transform=train_transform,
         random_negative_prob=args.random_negative_prob,
@@ -2363,6 +2438,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
         # train/skip_rate_* by pair type regardless of which (if any) of the
         # adaptive-sampling flags below are active.
         return_meta=True,
+        resize=loader_resize,
     )
     # Diagnostics/eval on the training split must stay on clean, index-only,
     # uniformly-sampled single-negative queries, even when the actual training
@@ -2373,11 +2449,11 @@ def run_training_lg(args: argparse.Namespace) -> None:
     # eval_epoch's 3-tuple unpack can't consume.
     train_ds_eval = IndexAssignedTripletDataset(
         args.train_index, root=args.data_root, transform=eval_transform,
-        feature_cache=feature_cache,
+        feature_cache=feature_cache, resize=loader_resize,
     )
     val_ds = IndexAssignedTripletDataset(
         args.val_index, root=args.data_root, transform=eval_transform,
-        feature_cache=feature_cache,
+        feature_cache=feature_cache, resize=loader_resize,
     )
 
     # persistent_workers=True (get_loader's default) would pickle train_ds into
@@ -2393,6 +2469,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, seed=args.seed,
         persistent_workers=(not dataset_mutates) and args.num_workers > 0,
+        collate_fn=collate_variable_images,
     )
 
     _rng = random.Random(args.seed)
@@ -2405,11 +2482,13 @@ def run_training_lg(args: argparse.Namespace) -> None:
         _fixed_subset(train_ds_eval, 10 * args.batch_size / max(len(train_ds_eval), 1)),
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
+        collate_fn=collate_variable_images,
     )
     mini_val_loader = get_loader(
         _fixed_subset(val_ds, 10 * args.batch_size / max(len(val_ds), 1)),
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
+        collate_fn=collate_variable_images,
     )
     # Video-level pseudo-accuracy needs every video's full set of query
     # frames present, so no subsetting here (unlike the mini-loaders above).
@@ -2426,8 +2505,9 @@ def run_training_lg(args: argparse.Namespace) -> None:
     # pass (see rdd_patch/lightglue_masked.py); irrelevant when RDD is frozen.
     lg  = build_masked_lg(device, weights=args.lg_weights, detach_descriptors=not train_rdd)
 
-    for p in rdd.parameters():
-        p.requires_grad_(train_rdd)
+    configure_rdd_trainable_component(
+        rdd, train_rdd, args.rdd_train_component
+    )
 
     if args.lora:
         if not train_lg:
@@ -2590,27 +2670,46 @@ def run_training_lg(args: argparse.Namespace) -> None:
 
     # ── baseline eval (before any training) ──
     global_step = 0
-    # --eval_only: the train-split pass only exists to track the train/val gap
-    # during training, so it's pure overhead here; baseline_train stays {} and
-    # drops out of the merged dict below.
-    baseline_train = {}
-    if not args.eval_only:
-        baseline_train = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_train_loader, args, prefix="train_eval")
-    baseline_val = eval_pseudo_accuracy(
-        accelerator, rdd, eval_lg, eval_val_loader, args, prefix="val", verbose=args.eval_only)
-    _unwrap(rdd).train(train_rdd)
-    lg.train(train_lg)
-    if accelerator.is_main_process:
-        accelerator.log(
-            {
-                **loader_diagnostics,
-                **baseline_train,
-                **baseline_val,
-                "epoch": -1,
-                "train/random_negative_prob": train_ds.random_negative_prob,
-            },
-            step=global_step,
-        )
+    start_epoch = 0
+    if args.resume is not None:
+        # After prepare(): load_state fills the prepared (DDP-wrapped) model(s) and optimizer
+        # and every rank's RNG file. The scheduler is not registered with accelerate, so it
+        # comes from the scheduler.pt written next to the state (older checkpoints: replayed).
+        accelerator.load_state(str(args.resume))
+        start_epoch = resume_epoch(args.resume) + 1
+        global_step = start_epoch * len(train_loader)
+        scheduler_state = args.resume / "scheduler.pt"
+        if scheduler_state.is_file():
+            scheduler.load_state_dict(torch.load(scheduler_state, map_location="cpu"))
+        else:
+            for _ in range(start_epoch):
+                scheduler.step()
+        accelerator.print(f"[resume] {args.resume}: continuing at epoch {start_epoch}/{args.epochs}, "
+                          f"global_step={global_step}, lr={optimizer.param_groups[0]['lr']:.3e}")
+        set_rdd_training_mode(rdd, train_rdd, args.rdd_train_component)
+        lg.train(train_lg)
+    else:
+        # --eval_only: the train-split pass only exists to track the train/val gap
+        # during training, so it's pure overhead here; baseline_train stays {} and
+        # drops out of the merged dict below.
+        baseline_train = {}
+        if not args.eval_only:
+            baseline_train = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_train_loader, args, prefix="train_eval")
+        baseline_val = eval_pseudo_accuracy(
+            accelerator, rdd, eval_lg, eval_val_loader, args, prefix="val", verbose=args.eval_only)
+        set_rdd_training_mode(rdd, train_rdd, args.rdd_train_component)
+        lg.train(train_lg)
+        if accelerator.is_main_process:
+            accelerator.log(
+                {
+                    **loader_diagnostics,
+                    **baseline_train,
+                    **baseline_val,
+                    "epoch": -1,
+                    "train/random_negative_prob": train_ds.random_negative_prob,
+                },
+                step=global_step,
+            )
 
     if args.eval_only:
         if accelerator.is_main_process:
@@ -2623,7 +2722,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
     # ── loop ──
     prev_dead_pos_index: set[str] | None = None
     live_margin = args.lg_margin
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         epoch_loss, global_step, neg_gap_stats, prev_dead_pos_index, epoch_extras = train_epoch_lg(
             accelerator, rdd, lg, eval_lg, optimizer, train_loader,
             mini_train_loader, mini_val_loader,
@@ -2680,7 +2779,7 @@ def run_training_lg(args: argparse.Namespace) -> None:
             train_eval_metrics = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_train_loader, args, prefix="train_eval")
             val_metrics        = eval_pseudo_accuracy(accelerator, rdd, eval_lg, eval_val_loader,   args, prefix="val")
         epoch_eval_time = time.perf_counter() - t_eval_start
-        _unwrap(rdd).train(train_rdd)
+        set_rdd_training_mode(rdd, train_rdd, args.rdd_train_component)
         lg.train(train_lg)
 
         scheduler.step()
@@ -2720,8 +2819,10 @@ def run_training_lg(args: argparse.Namespace) -> None:
         # file is still written once.
         ckpt_dir = args.output_dir / f"epoch_{epoch:02d}"
         accelerator.save_state(str(ckpt_dir))
-        if accelerator.is_main_process and ema_lg is not None:
-            torch.save(ema_lg.state_dict(), ckpt_dir / "ema_lg.pt")
+        if accelerator.is_main_process:
+            torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")  # for --resume
+            if ema_lg is not None:
+                torch.save(ema_lg.state_dict(), ckpt_dir / "ema_lg.pt")
 
     if args.project:
         accelerator.end_training()
